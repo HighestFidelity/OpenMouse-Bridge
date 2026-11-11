@@ -140,15 +140,16 @@ fn apply_settings_with_snapshot(
 }
 
 /// Reads a `brand` mouse's status via the Node helper. `Ok(None)` means
-/// the helper has no driver for the brand or the mouse reports no battery
-/// (a wired mouse); `Err` means a driver exists but no mouse answered.
+/// the mouse reports no battery (a wired mouse); a [`super::NoDriver`] error
+/// means the helper has no driver for the brand; any other `Err` means a
+/// driver exists but no mouse answered.
 pub fn read_status(brand: &str) -> Result<Option<NativeStatus>> {
     let request = StatusRequest {
         brand,
         action: "status",
     };
     let Some(stdout) = run_helper(&request)? else {
-        return Ok(None);
+        return Err(super::NoDriver.into());
     };
     let reply: StatusReply = serde_json::from_slice(&stdout)
         .context("the native-hid helper returned an unreadable status")?;

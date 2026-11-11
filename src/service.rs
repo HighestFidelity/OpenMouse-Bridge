@@ -506,6 +506,31 @@ pub struct BridgeService {
     native_automation: Arc<std::sync::Mutex<crate::drivers::automation::NativeAutomation>>,
     // Set while a battery poll runs, so two never overlap.
     battery_polling: Arc<AtomicBool>,
+    // Brands the native-hid helper has no driver for, skipped by the
+    // battery poll for a while instead of starting the helper every time.
+    no_driver: Arc<std::sync::Mutex<NoDriverBrands>>,
+}
+
+/// How long the battery poll skips a brand the helper had no driver for.
+const NO_DRIVER_RETRY: Duration = Duration::from_secs(60 * 60);
+
+/// Brands whose native read last said "no driver", and when.
+#[derive(Default)]
+struct NoDriverBrands(HashMap<String, Instant>);
+
+impl NoDriverBrands {
+    fn remember(&mut self, device_id: &str, now: Instant) {
+        self.0.insert(brand_of(device_id).to_ascii_lowercase(), now);
+    }
+
+    /// Whether to skip reading `device_id`, its brand having had no driver
+    /// within `NO_DRIVER_RETRY`.
+    fn skips(&mut self, device_id: &str, now: Instant) -> bool {
+        self.0
+            .retain(|_, since| now.saturating_duration_since(*since) < NO_DRIVER_RETRY);
+        self.0
+            .contains_key(&brand_of(device_id).to_ascii_lowercase())
+    }
 }
 
 /// Whether Home should offer this version's notes: Bridge has run before
@@ -868,7 +893,14 @@ impl BridgeService {
             buttons: Arc::default(),
             native_automation: Arc::default(),
             battery_polling: Arc::default(),
+            no_driver: Arc::default(),
         }
+    }
+
+    fn no_driver_brands(&self) -> std::sync::MutexGuard<'_, NoDriverBrands> {
+        self.no_driver
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Opens the tray panel. A second Bridge launch calls this over localhost
@@ -2080,6 +2112,10 @@ async fn poll_batteries_once(service: BridgeService) {
         return;
     }
     for (device_id, device_name) in devices {
+        if service.no_driver_brands().skips(&device_id, Instant::now()) {
+            tracing::debug!(%device_id, "No native battery reader for this device");
+            continue;
+        }
         let id = device_id.clone();
         let outcome = tokio::task::spawn_blocking(move || crate::drivers::read_status(&id)).await;
         match outcome {
@@ -2122,6 +2158,12 @@ async fn poll_batteries_once(service: BridgeService) {
             }
             Ok(Ok(None)) => {
                 tracing::debug!(%device_id, "No native battery reader for this device");
+            }
+            Ok(Err(error)) if error.is::<drivers::NoDriver>() => {
+                tracing::debug!(%device_id, "No native battery reader for this device");
+                service
+                    .no_driver_brands()
+                    .remember(&device_id, Instant::now());
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, %device_id, "Could not read the mouse battery");
@@ -3256,6 +3298,22 @@ mod tests {
         assert!(!known[0].connected);
         assert!(known[0].last_seen_seconds_ago >= 3 * 60 * 60);
         assert_eq!(known[0].percent, Some(40));
+    }
+
+    #[test]
+    fn a_brand_without_a_driver_is_skipped_for_an_hour() {
+        let mut brands = NoDriverBrands::default();
+        let start = Instant::now();
+        assert!(!brands.skips("Corsair:M65", start));
+        brands.remember("Corsair:M65", start);
+        assert!(brands.skips("corsair:046d:c547", start), "the whole brand");
+        assert!(!brands.skips("Razer:Viper", start));
+        assert!(brands.skips(
+            "Corsair:M65",
+            start + NO_DRIVER_RETRY - Duration::from_secs(1)
+        ));
+        assert!(!brands.skips("Corsair:M65", start + NO_DRIVER_RETRY));
+        assert!(brands.0.is_empty(), "expired brands are dropped");
     }
 
     #[tokio::test]
