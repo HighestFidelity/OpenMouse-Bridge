@@ -48,6 +48,10 @@ enum UpdateSource {
         checksum_url: String,
         /// `<archive>.sha256.sig`, when a signing key is built in.
         signature_url: Option<String>,
+        /// The release tag the signature must name.
+        tag: String,
+        /// The archive the checksum file must name.
+        archive_name: &'static str,
     },
     /// This install's asset in `latest.json`.
     Feed {
@@ -338,6 +342,8 @@ async fn prepare_claimed(update: &UpdateInfo) -> Result<ApplyPlan> {
             archive_url,
             checksum_url,
             signature_url,
+            tag,
+            archive_name,
         } => {
             // The signature is checked before the archive is downloaded.
             let checksum = download(&client, checksum_url, MAX_CHECKSUM_BYTES, false).await?;
@@ -347,7 +353,16 @@ async fn prepare_claimed(update: &UpdateInfo) -> Result<ApplyPlan> {
                     .context("the update checksum has no signature; refusing the update")?;
                 let signature =
                     download(&client, url, signature::MAX_SIGNATURE_BYTES, false).await?;
-                signature::verify(&key, &checksum, &signature, "the update checksum")?;
+                signature::verify(
+                    &key,
+                    &signature::checksum_message(tag, &checksum),
+                    &signature,
+                    "the update checksum",
+                )?;
+                ensure!(
+                    checksum_file_name(&checksum) == Some(*archive_name),
+                    "the signed checksum is not for {archive_name}; refusing the update"
+                );
             }
             let archive = download(&client, archive_url, MAX_ARCHIVE_BYTES, true).await?;
             verify_checksum(&archive, &checksum)?;
@@ -491,6 +506,8 @@ fn package_update(release: &Release, available: Version) -> Result<UpdateInfo> {
             archive_url,
             checksum_url,
             signature_url,
+            tag: release.tag_name.clone(),
+            archive_name,
         },
     })
 }
@@ -550,6 +567,18 @@ fn runtime_is_placeholder(native_hid: &Path) -> bool {
     };
     fs::metadata(runtime)
         .is_ok_and(|metadata| metadata.is_file() && metadata.len() < PLACEHOLDER_RUNTIME_MAX_BYTES)
+}
+
+/// The file name in a `sha256sum`-style line (`<hash>  <name>`, `*` marks
+/// binary mode).
+fn checksum_file_name(checksum_file: &[u8]) -> Option<&str> {
+    let mut fields = std::str::from_utf8(checksum_file).ok()?.split_whitespace();
+    fields.next()?;
+    let name = fields.next()?;
+    fields
+        .next()
+        .is_none()
+        .then(|| name.strip_prefix('*').unwrap_or(name))
 }
 
 fn verify_checksum(archive: &[u8], checksum_file: &[u8]) -> Result<()> {
