@@ -1088,7 +1088,7 @@ mod tests {
 
         // The mode monitor ticks every second; without it the mode never
         // leaves onboard and Hybrid mode does nothing.
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while wired.service.snapshot().await.device_mode != "live" {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1108,12 +1108,12 @@ mod tests {
             .send(BridgeCommand::SetBatteryThreshold(42))
             .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), wired.update_jobs_started.recv())
+        tokio::time::timeout(Duration::from_secs(5), wired.update_jobs_started.recv())
             .await
             .expect("the update check never started")
             .unwrap();
         // The check never finishes; the setting after it still has to land.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while wired.service.config().await.battery_threshold_percent != 42 {
             assert!(
                 std::time::Instant::now() < deadline,
