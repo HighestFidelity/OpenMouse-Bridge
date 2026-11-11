@@ -1816,9 +1816,8 @@ pub async fn serve(mut socket: WebSocket) {
     };
     tracing::info!(session_id, "HID websocket connected");
     start_resume_watch();
-    let mut resume_seen = RESUME_GENERATION.load(Ordering::Acquire);
-    let mut resume_tick = tokio::time::interval(Duration::from_secs(1));
-    let (input_tx, mut input_rx, mut failure_rx) = input_channel();
+    let resume_seen = RESUME_GENERATION.load(Ordering::Acquire);
+    let (input_tx, input_rx, failure_rx) = input_channel();
     // Opening the session enumerates HID devices under a process-wide lock:
     // keep that off the async workers.
     let opened = tokio::task::spawn_blocking(move || HidSession::new(session_id, input_tx))
@@ -1833,10 +1832,78 @@ pub async fn serve(mut socket: WebSocket) {
         }
     };
 
+    run_session(
+        &mut socket,
+        session_id,
+        &session,
+        input_rx,
+        failure_rx,
+        resume_seen,
+    )
+    .await;
+
+    // Dropping the session joins its reader threads. Every reader is told to
+    // stop first, so this waits out about one read timeout in total.
+    let _ = tokio::task::spawn_blocking(move || drop(session)).await;
+    note_session_ended(session_id);
+    tracing::info!(session_id, "HID websocket disconnected");
+}
+
+/// What the websocket loop runs commands on: the HID session, or a fake one
+/// in tests.
+trait SessionWorker: Send + 'static {
+    fn execute(&mut self, message: ClientMessage) -> Reply;
+    fn handle_resume(&mut self);
+}
+
+impl SessionWorker for HidSession {
+    fn execute(&mut self, message: ClientMessage) -> Reply {
+        HidSession::execute(self, message)
+    }
+
+    fn handle_resume(&mut self) {
+        HidSession::handle_resume(self);
+    }
+}
+
+/// The one command running on a blocking worker.
+struct PendingCommand {
+    request_id: u64,
+    command: &'static str,
+    task: tokio::task::JoinHandle<Reply>,
+}
+
+/// Resolves when the pending command finishes; never, when none is running.
+async fn pending_reply(
+    pending: &mut Option<PendingCommand>,
+) -> Result<Reply, tokio::task::JoinError> {
+    match pending {
+        Some(pending) => (&mut pending.task).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The websocket loop. Commands run one at a time on a blocking worker, and
+/// the next command is not read until the previous reply is sent, so replies
+/// keep the order of their commands. While a command runs, input reports keep
+/// going to the socket: a slow feature report exchange must not let a fast
+/// reporting device fill the input queue. Every frame is sent from this one
+/// task, so the socket never has two writers.
+async fn run_session<W: SessionWorker>(
+    socket: &mut impl HidSocket,
+    session_id: u64,
+    session: &Arc<Mutex<W>>,
+    mut input_rx: mpsc::Receiver<InputReport>,
+    mut failure_rx: watch::Receiver<bool>,
+    mut resume_seen: u64,
+) {
+    let mut resume_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut pending: Option<PendingCommand> = None;
     loop {
-        // Overflow ends the session first. Input reports come before new
-        // commands, so a stream of commands cannot keep the input queue from
-        // draining until it overflows.
+        // Overflow ends the session first. Input reports come before
+        // replies and new commands, so neither a slow command nor a stream
+        // of commands can keep the input queue from draining until it
+        // overflows.
         tokio::select! {
             biased;
             _ = failure_rx.changed() => {
@@ -1845,10 +1912,23 @@ pub async fn serve(mut socket: WebSocket) {
             }
             report = input_rx.recv() => {
                 let Some(report) = report else { break };
-                if send_json(&mut socket, &report).await.is_err() { break; }
+                if send_json(socket, &report).await.is_err() { break; }
             }
-            message = socket.recv() => {
-                let Some(Ok(message)) = message else { break };
+            outcome = pending_reply(&mut pending), if pending.is_some() => {
+                let Some(PendingCommand { request_id, command, .. }) = pending.take() else {
+                    unreachable!("the branch only runs with a command pending");
+                };
+                let reply = match outcome {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        tracing::error!(session_id, request_id, command, %error, "HID command panicked");
+                        Reply::error(request_id, format!("native HID worker stopped: {error}"))
+                    }
+                };
+                if send_json(socket, &reply).await.is_err() { break; }
+            }
+            message = socket.recv(), if pending.is_none() => {
+                let Some(message) = message else { break };
                 let Message::Text(text) = message else {
                     if matches!(message, Message::Close(_)) { break; }
                     continue;
@@ -1857,7 +1937,7 @@ pub async fn serve(mut socket: WebSocket) {
                     Ok(request) => request,
                     Err(error) => {
                         tracing::warn!(session_id, %error, "Invalid HID websocket command");
-                        if send_json(&mut socket, &Reply::error(0, format!("invalid HID command: {error}"))).await.is_err() {
+                        if send_json(socket, &Reply::error(0, format!("invalid HID command: {error}"))).await.is_err() {
                             break;
                         }
                         continue;
@@ -1865,28 +1945,22 @@ pub async fn serve(mut socket: WebSocket) {
                 };
                 let request_id = request.id;
                 let command = request.command.kind();
-                let worker = Arc::clone(&session);
-                let reply = match tokio::task::spawn_blocking(move || {
-                    // A panicked command is answered below with its own error. Left
+                let worker = Arc::clone(session);
+                let task = tokio::task::spawn_blocking(move || {
+                    // A panicked command is answered with its own error. Left
                     // poisoned, the lock would fail every later command, `list` too.
                     worker
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .execute(request)
-                }).await {
-                    Ok(reply) => reply,
-                    Err(error) => {
-                        tracing::error!(session_id, request_id, command, %error, "HID command panicked");
-                        Reply::error(request_id, format!("native HID worker stopped: {error}"))
-                    }
-                };
-                if send_json(&mut socket, &reply).await.is_err() { break; }
+                });
+                pending = Some(PendingCommand { request_id, command, task });
             }
-            _ = resume_tick.tick() => {
+            _ = resume_tick.tick(), if pending.is_none() => {
                 let generation = RESUME_GENERATION.load(Ordering::Acquire);
                 if generation != resume_seen {
                     resume_seen = generation;
-                    let worker = Arc::clone(&session);
+                    let worker = Arc::clone(session);
                     let _ = tokio::task::spawn_blocking(move || {
                         worker
                             .lock()
@@ -1897,12 +1971,11 @@ pub async fn serve(mut socket: WebSocket) {
             }
         }
     }
-
-    // Dropping the session joins its reader threads. Every reader is told to
-    // stop first, so this waits out about one read timeout in total.
-    let _ = tokio::task::spawn_blocking(move || drop(session)).await;
-    note_session_ended(session_id);
-    tracing::info!(session_id, "HID websocket disconnected");
+    // A command still running keeps the hardware busy: let it finish before
+    // the session counts as closed, as when commands were awaited inline.
+    if let Some(pending) = pending {
+        let _ = pending.task.await;
+    }
 }
 
 trait HidSocket {
@@ -1910,6 +1983,10 @@ trait HidSocket {
         &mut self,
         message: Message,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+
+    /// The next frame from the client; `None` once the socket is closed or
+    /// failed.
+    fn recv(&mut self) -> impl std::future::Future<Output = Option<Message>> + Send;
 }
 
 impl HidSocket for WebSocket {
@@ -1917,6 +1994,10 @@ impl HidSocket for WebSocket {
         WebSocket::send(self, message)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn recv(&mut self) -> Option<Message> {
+        WebSocket::recv(self).await?.ok()
     }
 }
 
@@ -2028,6 +2109,157 @@ mod tests {
             self.frames.push(message);
             Ok(())
         }
+
+        async fn recv(&mut self) -> Option<Message> {
+            std::future::pending().await
+        }
+    }
+
+    /// A client: frames to Bridge come from `incoming`, every frame Bridge
+    /// sends is parsed onto `outgoing`.
+    struct ChannelSocket {
+        incoming: mpsc::UnboundedReceiver<Message>,
+        outgoing: mpsc::UnboundedSender<serde_json::Value>,
+    }
+
+    impl HidSocket for ChannelSocket {
+        async fn send(&mut self, message: Message) -> Result<(), String> {
+            let Message::Text(text) = message else {
+                return Err("expected a text frame".into());
+            };
+            let value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+            self.outgoing.send(value).map_err(|error| error.to_string())
+        }
+
+        async fn recv(&mut self) -> Option<Message> {
+            self.incoming.recv().await
+        }
+    }
+
+    /// Command 1 blocks until released, standing in for a slow feature report
+    /// exchange; the others answer at once.
+    struct SlowWorker {
+        started: mpsc::UnboundedSender<u64>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl SessionWorker for SlowWorker {
+        fn execute(&mut self, message: ClientMessage) -> Reply {
+            self.started.send(message.id).unwrap();
+            if message.id == 1 {
+                self.release.recv().unwrap();
+            }
+            Reply::ok(message.id)
+        }
+
+        fn handle_resume(&mut self) {}
+    }
+
+    struct SessionHarness {
+        input_tx: InputSender,
+        client_tx: mpsc::UnboundedSender<Message>,
+        frames: mpsc::UnboundedReceiver<serde_json::Value>,
+        started: mpsc::UnboundedReceiver<u64>,
+        release: std::sync::mpsc::Sender<()>,
+        session: tokio::task::JoinHandle<()>,
+    }
+
+    fn start_session() -> SessionHarness {
+        let (input_tx, input_rx, failure_rx) = input_channel();
+        let (client_tx, incoming) = mpsc::unbounded_channel();
+        let (outgoing, frames) = mpsc::unbounded_channel();
+        let (started_tx, started) = mpsc::unbounded_channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let worker = Arc::new(Mutex::new(SlowWorker {
+            started: started_tx,
+            release: release_rx,
+        }));
+        let resume_seen = RESUME_GENERATION.load(Ordering::Acquire);
+        let session = tokio::spawn(async move {
+            let mut socket = ChannelSocket { incoming, outgoing };
+            run_session(&mut socket, 0, &worker, input_rx, failure_rx, resume_seen).await;
+        });
+        SessionHarness {
+            input_tx,
+            client_tx,
+            frames,
+            started,
+            release,
+            session,
+        }
+    }
+
+    fn list_command(id: u64) -> Message {
+        Message::Text(format!(r#"{{"id":{id},"type":"list","vendorIds":[]}}"#).into())
+    }
+
+    fn input_report(byte: u8) -> InputReport {
+        InputReport {
+            kind: "inputreport",
+            device: "hid-test".into(),
+            report_id: 2,
+            data: vec![byte],
+        }
+    }
+
+    async fn next_frame(
+        frames: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("frame within 2 s")
+            .expect("session still sending")
+    }
+
+    #[tokio::test]
+    async fn input_reports_flow_while_a_slow_command_runs_and_replies_stay_ordered() {
+        let mut harness = start_session();
+        for id in 1..=3 {
+            harness.client_tx.send(list_command(id)).unwrap();
+        }
+        assert_eq!(harness.started.recv().await, Some(1));
+        for byte in 0..3 {
+            harness.input_tx.send(input_report(byte)).unwrap();
+        }
+        // Command 1 is still running: its input reports reach the client anyway.
+        for byte in 0..3 {
+            let frame = next_frame(&mut harness.frames).await;
+            assert_eq!(frame["type"], "inputreport", "{frame}");
+            assert_eq!(frame["data"], serde_json::json!([byte]));
+        }
+        // Commands stay one at a time: 2 is not read before 1 is answered.
+        assert!(harness.started.try_recv().is_err());
+        harness.release.send(()).unwrap();
+        for id in 1..=3 {
+            let frame = next_frame(&mut harness.frames).await;
+            assert_eq!(frame["id"], id, "{frame}");
+            assert_eq!(frame["ok"], true);
+        }
+        assert_eq!(harness.started.recv().await, Some(2));
+        assert_eq!(harness.started.recv().await, Some(3));
+        drop(harness.client_tx);
+        tokio::time::timeout(Duration::from_secs(2), harness.session)
+            .await
+            .expect("a closed client ends the session")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn overflow_during_a_slow_command_still_ends_the_session() {
+        let mut harness = start_session();
+        harness.client_tx.send(list_command(1)).unwrap();
+        assert_eq!(harness.started.recv().await, Some(1));
+        harness.input_tx.failed.send_replace(true);
+        // The session waits for the running command before it counts as closed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!harness.session.is_finished());
+        harness.release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), harness.session)
+            .await
+            .expect("overflow ends the session")
+            .unwrap();
+        // Its reply is dropped with the session; nothing else was sent.
+        assert!(harness.frames.try_recv().is_err());
     }
 
     #[test]
