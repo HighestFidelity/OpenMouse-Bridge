@@ -653,7 +653,7 @@ fn estimate_minutes_remaining(
     (minutes > 0 && minutes <= BATTERY_MAX_ESTIMATE_MINUTES).then_some(minutes)
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceBattery {
     pub device_id: String,
@@ -680,7 +680,7 @@ pub struct DeviceBattery {
 /// device that ever reported a charge level — this reflects the live HID
 /// session, so the status view can follow device switches (including wired
 /// mice that never report battery).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveDevice {
     pub key: String,
@@ -689,14 +689,14 @@ pub struct ActiveDevice {
     pub product_id: u16,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GameActivity {
     pub name: String,
     pub active: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeSnapshot {
     pub version: &'static str,
@@ -739,7 +739,7 @@ pub struct BridgeSnapshot {
 }
 
 /// A remembered mouse as the status view shows it.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KnownDeviceStatus {
     pub id: String,
