@@ -22,3 +22,19 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
 - t3/n12-hardening (P9-OMB6, N12 partial): HID collection nesting capped at 64; Windows .pfx / macOS .p12
   no longer left in RUNNER_TEMP for later steps.
 - t3/signed-feed-test (P9-OMB7): end-to-end test of the signed latest.json check (fetch_feed).
+- t3/remove-bridge-server (#25): unused native-hid/bridge-server.mjs and its gate removed, stale allowScripts pins trimmed.
+- t3/ideas-api-hid (P9-OMB13, ideas #7 #8 #9 #21): peer uid checked once per connection (shared verdict), HID
+  session open/close in spawn_blocking, input drained before new commands, button presses logged at debug.
+- t3/ideas-ci (P9-OMB12, ideas #12 #13 #14 #23 #24): CI runs on main pushes; one Node.js pin source
+  (.github/scripts/native-hid-node.mjs) for test and build; Rust pinned to 1.99.1 (rust-toolchain.toml,
+  rust-version, workflows, checked by a test); epaint_default_fonts dropped.
+- t3/ideas-runtime (P9-OMB10, ideas #2 #5 #11 #17 #6a): API port bound before config/catalog, catalog fetched in
+  the background; update checks/installs run in their own serial queue off the tray loop; quit waits at most 2 s
+  for blocking work; headless drops panel/snapshot channels; a failed catalog save only warns.
+- t3/bad-config (#6b, P9-OMB14): an unparsable config.json is renamed to config.json.bad-<ts>, Bridge starts on defaults and the tray says where the old file is. Unreadable files still fail (nothing replaced unless kept).
+- t3/ideas-perf (P9-OMB11, ideas #3 #4 #16 #18 #19 #22): one process scan per tick in spawn_blocking (icons too),
+  blocked-HID list cached by the device scanner, config saves serialized outside the state lock, panel repaints
+  only on visible change, X11 connection kept between polls, brands with no native driver skipped for 1 h.
+- t3/hybrid-mode (P9-OMB14, #1 #20): run_server starts the mode monitor, so Hybrid mode works; the onboard restore
+  after the web panel leaves goes through reconcile_native (forced reapply) instead of a bare thread; the
+  background catalog refresh joins the config save queue. Not run on hardware.

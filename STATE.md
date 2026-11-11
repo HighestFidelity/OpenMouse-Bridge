@@ -36,4 +36,14 @@
   (CARGO_TARGET_DIR=/home/claude/workspace/temp/omb-target-win). CI uses MSVC; macOS still unchecked.
 - P9-OMB9: brainstorm agent writing reports/improvement-ideas.md; triage into tasks next.
 
-NEXT: triage reports/improvement-ideas.md (P9-OMB9); Victor pushes main (ahead of dd49d0f). Open: N4-N8, N10-N12 (his calls); N1 activation (key) when he wants.
+## 2026-11-11 Update (P9-OMB10..14, improvement ideas)
+- T3 restart killed the 4 helpers mid-task; resumed from their worktrees, nothing lost.
+- Merged to main (1f77224): ideas #2 #3 #4 #5 #6a #6b #7 #8 #9 #11 #12 #13 #14 #16 #17 #18 #19 #21 #22 #23 #24 #25,
+  plus #1 + #20 (Hybrid mode on, owner approved). Skipped: #10 (needs hardware), #15 (run_server wiring test, not picked).
+- Verified on 1f77224: fmt ok, cargo test 286+41+11 pass, clippy -D warnings clean on Linux and x86_64-pc-windows-gnu,
+  node .github/scripts 16/16 (check script: temp/omb-checks.sh). Rust is now pinned to 1.99.1 (rust-toolchain.toml);
+  the windows-gnu target was added to that toolchain.
+- Unverified: anything on hardware (Hybrid restore, X11 kept connection, HID spawn_blocking), workflows on a runner, MSVC/macOS.
+- Helper E risk [Inference]: a slow HID command (>~64 ms) still blocks input reads and can overflow the queue (#10 territory).
+
+NEXT: Victor pushes main (ahead of dd49d0f). Open: #10 and #15 (his call), N4-N8, N10-N12 (his calls), N1 activation (key) when he wants.
