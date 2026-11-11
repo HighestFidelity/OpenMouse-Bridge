@@ -16,6 +16,6 @@
 - Verified: cargo test --locked 264+39+11 pass (6 new), fmt --check and clippy -D warnings clean. Negative check: serving
   without api::make_service makes 8/11 integration tests 403, so the gate is live outside unit tests.
 - Unverified: macOS/Windows compile (no targets on the box), workflows on a real runner.
-- Pushing main is blocked for agents by git-guardrails: Victor pushes.
+- Pushing main is blocked for agents by git-guardrails: Victor pushes via docker exec into claude-code-app (creds live there, not on the host).
 
-NEXT: Victor pushes main (git -C /home/claude/data/AppData/claude-code-custom/projects/openmouse-bridge push origin main). Open items stay N1 (signing), N4/N5 (features), N6-N12. No task queued.
+NEXT: main pushed to origin at 9b8aa9b (verified with ls-remote 2026-11-11). Open items stay N1 (signing), N4/N5 (features), N6-N12. No task queued.
