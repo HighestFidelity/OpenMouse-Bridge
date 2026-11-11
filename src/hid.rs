@@ -1687,7 +1687,12 @@ pub async fn serve(mut socket: WebSocket) {
     let mut resume_seen = RESUME_GENERATION.load(Ordering::Acquire);
     let mut resume_tick = tokio::time::interval(Duration::from_secs(1));
     let (input_tx, mut input_rx, mut failure_rx) = input_channel();
-    let session = match HidSession::new(session_id, input_tx) {
+    // Opening the session enumerates HID devices under a process-wide lock:
+    // keep that off the async workers.
+    let opened = tokio::task::spawn_blocking(move || HidSession::new(session_id, input_tx))
+        .await
+        .unwrap_or_else(|error| Err(format!("native HID worker stopped: {error}")));
+    let session = match opened {
         Ok(session) => Arc::new(Mutex::new(session)),
         Err(error) => {
             tracing::warn!(session_id, %error, "HID session initialization failed");
@@ -1697,11 +1702,18 @@ pub async fn serve(mut socket: WebSocket) {
     };
 
     loop {
+        // Overflow ends the session first. Input reports come before new
+        // commands, so a stream of commands cannot keep the input queue from
+        // draining until it overflows.
         tokio::select! {
             biased;
             _ = failure_rx.changed() => {
                 tracing::warn!(session_id, "HID input overflow; disconnecting session");
                 break;
+            }
+            report = input_rx.recv() => {
+                let Some(report) = report else { break };
+                if send_json(&mut socket, &report).await.is_err() { break; }
             }
             message = socket.recv() => {
                 let Some(Ok(message)) = message else { break };
@@ -1751,14 +1763,12 @@ pub async fn serve(mut socket: WebSocket) {
                     }).await;
                 }
             }
-            report = input_rx.recv() => {
-                let Some(report) = report else { break };
-                if send_json(&mut socket, &report).await.is_err() { break; }
-            }
         }
     }
 
-    drop(session);
+    // Dropping the session joins its reader threads, which can wait out a
+    // read timeout per path.
+    let _ = tokio::task::spawn_blocking(move || drop(session)).await;
     note_session_ended(session_id);
     tracing::info!(session_id, "HID websocket disconnected");
 }
