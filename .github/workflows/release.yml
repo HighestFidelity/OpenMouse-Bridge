@@ -5,48 +5,60 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   # The Node.js runtime bundled into native-hid/node/ so Bridge can push
   # DPI/polling-rate settings to non-Pulsar mice without end users needing
   # Node.js installed separately. Bump by hand when a newer LTS ships.
   NATIVE_HID_NODE_VERSION: v24.18.1
+  # Bump together with NATIVE_HID_NODE_VERSION: the SHA-256 of each archive
+  # below, from https://nodejs.org/dist/<version>/SHASUMS256.txt.
+  NATIVE_HID_NODE_SHA256_DARWIN_ARM64: eb02f7fab96d3d67de40c5ec8566096fcb4c2026728787683ae5a97eb612b941
+  NATIVE_HID_NODE_SHA256_DARWIN_X64: 6fb20fceacbb157c2f95825b80df4a454a0f6d81cdcd7bb81eeae9147e0e76ec
+  NATIVE_HID_NODE_SHA256_LINUX_X64: d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0
+  NATIVE_HID_NODE_SHA256_WIN_X64: ec56b84a7551893ab2324ebdfdc4ab974a63b4781162600b68a1293cc3e53765
 
 jobs:
   preflight:
     name: Check the version and changelog
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
       # Fails in a minute, before an hour of builds, when the tag, Cargo.toml
       # and CHANGELOG.md disagree.
       - name: Verify tag matches Cargo version
-        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "${{ github.ref_name }}"
+        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
       - name: Verify CHANGELOG.md has an entry for this version
         run: |
           node --input-type=module -e '
             import { readFileSync } from "node:fs";
             import { changelogEntry, versionFromTag } from "./.github/scripts/make-release-files.mjs";
             changelogEntry(readFileSync("CHANGELOG.md", "utf8"), versionFromTag(process.argv[1]));
-          ' "${{ github.ref_name }}"
+          ' "$GITHUB_REF_NAME"
   windows:
     name: Windows x64
     needs: preflight
     runs-on: windows-latest
+    # Not secrets: whether the signing secrets exist. The secrets themselves
+    # are passed only to the steps that sign.
     env:
-      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      HAS_WINDOWS_SIGNING: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v5
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
           cache: npm
@@ -60,8 +72,11 @@ jobs:
           npm ci --prefix native-hid
           npm test --prefix native-hid
       - name: Sign executable
-        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        if: env.HAS_WINDOWS_SIGNING == 'true'
         shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           $certificate = Join-Path $env:RUNNER_TEMP "openmouse-bridge.pfx"
           [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
@@ -77,6 +92,9 @@ jobs:
             Where-Object { $_.Name -ne "HID-win32-x64" } |
             Remove-Item -Recurse -Force
           Invoke-WebRequest -Uri "https://nodejs.org/dist/$env:NATIVE_HID_NODE_VERSION/node-$env:NATIVE_HID_NODE_VERSION-win-x64.zip" -OutFile node.zip
+          # Verify the archive against its pinned SHA-256 before extracting.
+          $nodeZipHash = (Get-FileHash node.zip -Algorithm SHA256).Hash
+          if ($nodeZipHash -ne $env:NATIVE_HID_NODE_SHA256_WIN_X64) { throw "node.zip SHA-256 mismatch: got $nodeZipHash" }
           Expand-Archive node.zip -DestinationPath node-extracted
           New-Item -ItemType Directory -Force -Path native-hid/node | Out-Null
           Copy-Item "node-extracted/node-$env:NATIVE_HID_NODE_VERSION-win-x64/node.exe" native-hid/node/node.exe
@@ -110,8 +128,10 @@ jobs:
           Expand-Archive openmouse-bridge-windows-x64-full.zip -DestinationPath $stage
           ./packaging/windows/build-installer.ps1 -Stage $stage -OutputDirectory .
       - name: Sign Windows installer
-        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        if: env.HAS_WINDOWS_SIGNING == 'true'
         shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
           $certificate = Join-Path $env:RUNNER_TEMP 'openmouse-bridge.pfx'
@@ -119,7 +139,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
           $checksum = (Get-FileHash OpenMouse-Bridge-windows-x64-setup.exe -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' + "`n"
           [IO.File]::WriteAllText('OpenMouse-Bridge-windows-x64-setup.exe.sha256', $checksum, [Text.UTF8Encoding]::new($false))
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: bridge-windows
           path: |
@@ -136,21 +156,22 @@ jobs:
     runs-on: macos-15
     # Signing and notarization are automatic when these secrets exist;
     # without them the app is ad-hoc signed.
+    # The flags say whether the secrets exist; the secrets themselves are
+    # passed only to the steps that use them.
     env:
-      MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      HAS_MAC_SIGNING: ${{ secrets.MACOS_CERTIFICATE_BASE64 != '' }}
+      HAS_MAC_NOTARIZATION: ${{ secrets.MACOS_CERTIFICATE_BASE64 != '' && secrets.APPLE_ID != '' }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           components: clippy, rustfmt
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v5
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
           cache: npm
@@ -174,8 +195,14 @@ jobs:
           # silicon and Intel since the Bridge binary itself is universal.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
             ! -name HID-darwin-arm64 ! -name HID-darwin-x64 -exec rm -rf {} +
-          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz" | tar -xz
-          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz" | tar -xz
+          # Verify each archive against its pinned SHA-256 before extracting.
+          arm64_tar="$RUNNER_TEMP/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz"
+          x64_tar="$RUNNER_TEMP/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 -o "$arm64_tar" "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 -o "$x64_tar" "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz"
+          printf '%s  %s\n' "$NATIVE_HID_NODE_SHA256_DARWIN_ARM64" "$arm64_tar" "$NATIVE_HID_NODE_SHA256_DARWIN_X64" "$x64_tar" | shasum -a 256 -c
+          tar -xzf "$arm64_tar"
+          tar -xzf "$x64_tar"
           mkdir -p native-hid/node/bin
           lipo -create \
             "node-$NATIVE_HID_NODE_VERSION-darwin-arm64/bin/node" \
@@ -196,7 +223,11 @@ jobs:
           packaging/bridge/build-bridge-package.sh openmouse-bridge openmouse-bridge-macos-universal.zip
           shasum -a 256 openmouse-bridge-macos-universal.zip > openmouse-bridge-macos-universal.zip.sha256
       - name: Import signing certificate
-        if: env.MACOS_CERTIFICATE_BASE64 != ''
+        if: env.HAS_MAC_SIGNING == 'true'
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           keychain="$RUNNER_TEMP/openmouse-signing.keychain-db"
@@ -210,30 +241,42 @@ jobs:
           security list-keychains -d user -s "$keychain" login.keychain-db
           echo "MACOS_SIGN_IDENTITY=$MACOS_SIGN_IDENTITY" >> "$GITHUB_ENV"
       - name: Build OpenMouse Bridge.app
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           mkdir -p dist
           packaging/macos/build-app.sh openmouse-bridge native-hid "$version" dist
       - name: Notarize app
-        if: env.MACOS_CERTIFICATE_BASE64 != '' && env.APPLE_ID != ''
+        if: env.HAS_MAC_NOTARIZATION == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
           ditto -c -k --keepParent "dist/OpenMouse Bridge.app" notarize-app.zip
           xcrun notarytool submit notarize-app.zip --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
           xcrun stapler staple "dist/OpenMouse Bridge.app"
       - name: Package DMG and app update archive
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           # Homebrew Python is externally managed (PEP 668), so use a venv.
           python3 -m venv "$RUNNER_TEMP/dmgbuild-venv"
-          "$RUNNER_TEMP/dmgbuild-venv/bin/python" -m pip install --quiet dmgbuild
+          "$RUNNER_TEMP/dmgbuild-venv/bin/python" -m pip install --quiet dmgbuild==1.6.7
           export PATH="$RUNNER_TEMP/dmgbuild-venv/bin:$PATH"
           packaging/macos/build-dmg.sh "dist/OpenMouse Bridge.app" OpenMouse-Bridge-macos-universal.dmg
           # Plain Info-ZIP (not ditto): the updater's strict extractor expects ordinary zip entries.
           (cd dist && zip -r -X -q "../openmouse-bridge-macos-app.zip" "OpenMouse Bridge.app")
           shasum -a 256 openmouse-bridge-macos-app.zip > openmouse-bridge-macos-app.zip.sha256
       - name: Notarize DMG
-        if: env.MACOS_CERTIFICATE_BASE64 != '' && env.APPLE_ID != ''
+        if: env.HAS_MAC_NOTARIZATION == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
           xcrun notarytool submit OpenMouse-Bridge-macos-universal.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
@@ -245,7 +288,7 @@ jobs:
           test -d "$RUNNER_TEMP/dmg/OpenMouse Bridge.app"
           codesign --verify --deep --strict "$RUNNER_TEMP/dmg/OpenMouse Bridge.app"
           hdiutil detach "$RUNNER_TEMP/dmg"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: bridge-macos
           path: |
@@ -263,14 +306,17 @@ jobs:
     # whose glibc is at least that old (as in gpui-build.yml).
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - name: Install Linux HID and GUI dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev appstream
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v5
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
           cache: npm
@@ -291,7 +337,11 @@ jobs:
           # ever runs on linux-x64.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
             ! -name HID-linux-x64 -exec rm -rf {} +
-          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-linux-x64.tar.xz" | tar -xJ
+          # Verify the archive against its pinned SHA-256 before extracting.
+          node_tar="$RUNNER_TEMP/node-$NATIVE_HID_NODE_VERSION-linux-x64.tar.xz"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 -o "$node_tar" "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-linux-x64.tar.xz"
+          printf '%s  %s\n' "$NATIVE_HID_NODE_SHA256_LINUX_X64" "$node_tar" | sha256sum -c
+          tar -xJf "$node_tar"
           mkdir -p native-hid/node/bin
           cp "node-$NATIVE_HID_NODE_VERSION-linux-x64/bin/node" native-hid/node/bin/node
           chmod +x native-hid/node/bin/node
@@ -345,7 +395,9 @@ jobs:
       - name: Build the AppImage
         run: |
           set -euo pipefail
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 120 -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          # Pinned release, verified before it runs. Bump the URL and hash together.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 120 -o appimagetool https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c
           chmod +x appimagetool
           # Runners have no FUSE, so the tool unpacks itself and runs from there.
           ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir OpenMouse-Bridge-linux-x86_64.AppImage
@@ -363,7 +415,7 @@ jobs:
           test -f squashfs-root/usr/share/applications/io.openmouse.bridge.desktop
           # Every shared library the binary needs must resolve on this machine.
           ! ldd squashfs-root/usr/bin/openmouse-bridge | grep 'not found'
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: bridge-linux
           path: |
@@ -378,12 +430,17 @@ jobs:
     name: Publish stable release
     needs: [windows, macos, linux]
     runs-on: ubuntu-latest
+    # Only this job writes: it creates or updates the GitHub release.
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: artifacts
           merge-multiple: true
@@ -394,7 +451,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir release
-          node .github/scripts/make-release-files.mjs "${{ github.ref_name }}" "${{ github.repository }}" artifacts release
+          node .github/scripts/make-release-files.mjs "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" artifacts release
           cat release/latest.json
       - name: Publish the release
         env:
@@ -403,12 +460,12 @@ jobs:
           set -euo pipefail
           # Re-cutting a tag replaces the assets and notes of the existing
           # release instead of deleting it, so the release is never missing.
-          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" --repo "${{ github.repository }}" --clobber artifacts/* release/latest.json
-            gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release/notes.md
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber artifacts/* release/latest.json
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file release/notes.md
           else
-            gh release create "${{ github.ref_name }}" \
-              --repo "${{ github.repository }}" \
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --notes-file release/notes.md \
               --latest \
