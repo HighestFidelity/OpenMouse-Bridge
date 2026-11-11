@@ -38,3 +38,7 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
 - t3/hybrid-mode (P9-OMB14, #1 #20): run_server starts the mode monitor, so Hybrid mode works; the onboard restore
   after the web panel leaves goes through reconcile_native (forced reapply) instead of a bare thread; the
   background catalog refresh joins the config save queue. Not run on hardware.
+- t3/run-server-wiring (P9-OMB15, idea #15a): run_server's startup wiring moved into start_background behind a
+  Host seam; tests prove the mode monitor starts and tray settings land while an update job runs.
+- t3/native-hid-tests (P9-OMB16, idea #15b): 19 node tests for apply.mjs, button-listener.mjs and the HID
+  adapter against a fake node-hid (npm test 19 pass; the 2 baseline failures need node-hid installed).
