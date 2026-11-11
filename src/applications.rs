@@ -294,9 +294,13 @@ mod imp {
     use std::collections::BTreeMap;
     use std::path::Path;
 
+    use std::sync::Mutex;
+
     use sysinfo::Pid;
     use x11rb::connection::Connection;
+    use x11rb::errors::{ConnectionError, ReplyError};
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+    use x11rb::rust_connection::RustConnection;
 
     use super::{ApplicationInfo, icon_id};
     use crate::games::GameDetector;
@@ -380,29 +384,76 @@ mod imp {
         if let Some(pid) = crate::kwin_focus::focused_pid() {
             return pid;
         }
-        let (conn, screen) = x11rb::connect(None).ok()?;
-        let root = conn.setup().roots[screen].root;
-        let active_window = intern(&conn, b"_NET_ACTIVE_WINDOW")?;
-        let pid_atom = intern(&conn, b"_NET_WM_PID")?;
-        let reply = conn
-            .get_property(false, root, active_window, AtomEnum::WINDOW, 0, 1)
-            .ok()?
-            .reply()
-            .ok()?;
-        let window = reply.value32()?.next()?;
-        if window == 0 {
-            return None;
+        static X11: Mutex<Option<X11Focus>> = Mutex::new(None);
+        let mut x11 = X11.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A connection that broke (the X server restarted) is replaced once
+        // in the same call, so the answer is the same as with a fresh one.
+        for _ in 0..2 {
+            if x11.is_none() {
+                *x11 = X11Focus::connect();
+            }
+            match x11.as_ref()?.focused_pid() {
+                Ok(pid) => return pid,
+                Err(_) => *x11 = None,
+            }
         }
-        let reply = conn
-            .get_property(false, window, pid_atom, AtomEnum::CARDINAL, 0, 1)
-            .ok()?
-            .reply()
-            .ok()?;
-        let pid = reply.value32()?.next()?;
-        (pid != 0).then_some(pid)
+        None
     }
 
-    fn intern(conn: &x11rb::rust_connection::RustConnection, name: &[u8]) -> Option<u32> {
+    /// One X connection kept across polls, with the two atoms it needs.
+    struct X11Focus {
+        conn: RustConnection,
+        root: u32,
+        active_window: u32,
+        pid_atom: u32,
+    }
+
+    impl X11Focus {
+        fn connect() -> Option<Self> {
+            let (conn, screen) = x11rb::connect(None).ok()?;
+            let root = conn.setup().roots[screen].root;
+            let active_window = intern(&conn, b"_NET_ACTIVE_WINDOW")?;
+            let pid_atom = intern(&conn, b"_NET_WM_PID")?;
+            Some(Self {
+                conn,
+                root,
+                active_window,
+                pid_atom,
+            })
+        }
+
+        /// `Err` only when the connection itself failed.
+        fn focused_pid(&self) -> Result<Option<u32>, ConnectionError> {
+            let window = self.property(self.root, self.active_window, AtomEnum::WINDOW)?;
+            let Some(window) = window.filter(|window| *window != 0) else {
+                return Ok(None);
+            };
+            let pid = self.property(window, self.pid_atom, AtomEnum::CARDINAL)?;
+            Ok(pid.filter(|pid| *pid != 0))
+        }
+
+        /// The first 32-bit value of `property` on `window`; `None` when it is
+        /// unset or the server refused the request (a window that just
+        /// closed).
+        fn property(
+            &self,
+            window: u32,
+            property: u32,
+            kind: AtomEnum,
+        ) -> Result<Option<u32>, ConnectionError> {
+            match self
+                .conn
+                .get_property(false, window, property, kind, 0, 1)?
+                .reply()
+            {
+                Ok(reply) => Ok(reply.value32().and_then(|mut values| values.next())),
+                Err(ReplyError::ConnectionError(error)) => Err(error),
+                Err(ReplyError::X11Error(_)) => Ok(None),
+            }
+        }
+    }
+
+    fn intern(conn: &RustConnection, name: &[u8]) -> Option<u32> {
         conn.intern_atom(false, name)
             .ok()?
             .reply()
