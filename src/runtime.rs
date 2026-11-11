@@ -58,10 +58,11 @@ fn run_headless(
     updates: Receiver<UpdateEvent>,
     notices: Receiver<Notice>,
 ) -> Result<()> {
-    // The snapshot channel only holds the latest; keep it drained so the
-    // publisher never blocks, and keep the update channel drained so the
-    // updater's try_send calls keep working.
-    let _ = (snapshots, commands);
+    // No panel here: dropping the snapshot receiver stops the publisher, and
+    // dropping the command sender leaves the tray command loop with nothing
+    // to wait for (update checks still run on their own). The update channel
+    // is drained below so the updater's try_send calls keep working.
+    drop((snapshots, commands));
     // Ctrl-C watcher on its own thread: the multi-thread Bridge runtime
     // already lives on the server thread, so this gets a current-thread one.
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
@@ -109,7 +110,9 @@ pub fn run() -> Result<()> {
             );
         }
         let (notice_tx, notices) = mpsc::channel();
-        let Some((server, snapshots, commands, updates, _panel_requests, _show_panel)) =
+        // No panel to open: dropping the panel-request receiver at once means
+        // a `PUT /v1/panel` has nowhere to queue up.
+        let Some((server, snapshots, commands, updates, _, _)) =
             BackgroundServer::start(notice_tx)?
         else {
             return Ok(());
@@ -355,6 +358,10 @@ async fn activate_running_bridge() -> bool {
     }
 }
 
+/// How long quitting waits for blocking work still running (a native-hid
+/// helper read can take 10 s) before the runtime lets it go.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 fn run_server(
     shutdown: oneshot::Receiver<()>,
     ready: SyncSender<Result<Startup, String>>,
@@ -368,8 +375,26 @@ fn run_server(
         .enable_all()
         .build()
         .context("could not create the Bridge async runtime")?;
-    runtime.block_on(async move {
-        let (bridge_config, path) = config::load_with_catalog().await?;
+    let outcome = runtime.block_on(async move {
+        // Bound before any slow startup work, so the API is up at once and a
+        // second launch finds this one without fetching or saving anything.
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BRIDGE_PORT);
+        let listener = match TcpListener::bind(address).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                // The first launch still holds 17846. Ask it to open the panel
+                // instead of exiting with nothing on screen.
+                if activate_running_bridge().await {
+                    tracing::info!("OpenMouse Bridge is already running; opening its tray panel");
+                    let _ = ready.send(Ok(Startup::AlreadyRunning));
+                    return Ok(());
+                }
+                return Err(error).context(format!(
+                    "could not bind http://{address}; is Bridge already running?"
+                ));
+            }
+        };
+        let (bridge_config, path) = config::load_or_create()?;
         let show_panel = !bridge_config.tray_hint_shown;
         let automatic_updates = bridge_config.automatic_updates;
         let origins = bridge_config.allowed_origins.clone();
@@ -381,6 +406,10 @@ fn run_server(
         service.on_show_panel(move || {
             let _ = panel_requests.send(());
         });
+        // The cached catalog serves until the fresh one arrives.
+        let catalog_service = service.clone();
+        let catalog_refresh =
+            tokio::spawn(async move { catalog_service.refresh_game_catalog().await });
         if let Err(error) = service.enable_autostart_once().await {
             tracing::warn!(%error, "Could not turn on launch at login");
         }
@@ -392,12 +421,25 @@ fn run_server(
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                let _ = snapshots.try_send(snapshot_service.snapshot().await);
+                // Nobody listens in headless mode: stop building snapshots.
+                if let Err(mpsc::TrySendError::Disconnected(_)) =
+                    snapshots.try_send(snapshot_service.snapshot().await)
+                {
+                    return;
+                }
             }
         });
 
+        // Update work runs apart from the tray commands, one job at a time in
+        // the order asked, so a 10-minute download never holds up a setting.
+        let (update_jobs, queued_update_jobs) = tokio_mpsc::unbounded_channel();
+        let worker_events = update_events.clone();
+        let update_worker = tokio::spawn(run_serially(queued_update_jobs, move |job| {
+            run_update_job(job, worker_events.clone())
+        }));
+
         let timer_service = service.clone();
-        let timer_events = update_events.clone();
+        let timer_jobs = update_jobs.clone();
         let update_timer = tokio::spawn(async move {
             if updater::is_stub_install() {
                 return;
@@ -405,7 +447,9 @@ fn run_server(
             loop {
                 tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
                 if timer_service.snapshot().await.automatic_updates {
-                    check_for_updates(true, &timer_events).await;
+                    let _ = timer_jobs.send(UpdateJob::Check {
+                        install_automatically: true,
+                    });
                 }
             }
         });
@@ -422,7 +466,9 @@ fn run_server(
             if updater::is_stub_install() {
                 tokio::spawn(finish_stub_install(update_events.clone()));
             } else if automatic_updates {
-                check_for_updates(true, &update_events).await;
+                let _ = update_jobs.send(UpdateJob::Check {
+                    install_automatically: true,
+                });
             }
             while let Some(command) = commands.recv().await {
                 match command {
@@ -443,7 +489,11 @@ fn run_server(
                     }
                     BridgeCommand::SetAutomaticUpdates(enabled) => {
                         match command_service.set_automatic_updates(enabled).await {
-                            Ok(()) if enabled => check_for_updates(true, &update_events).await,
+                            Ok(()) if enabled => {
+                                let _ = update_jobs.send(UpdateJob::Check {
+                                    install_automatically: true,
+                                });
+                            }
                             Ok(()) => {}
                             Err(error) => {
                                 tracing::error!(%error, "could not save Bridge settings");
@@ -464,22 +514,18 @@ fn run_server(
                         }
                     }
                     BridgeCommand::CheckForUpdates => {
-                        check_for_updates(false, &update_events).await;
+                        let _ = update_jobs.send(UpdateJob::Check {
+                            install_automatically: false,
+                        });
                     }
                     BridgeCommand::InstallUpdate(update) => {
-                        install_update(update, &update_events).await;
+                        let _ = update_jobs.send(UpdateJob::Install(update));
                     }
-                    BridgeCommand::ApplyUpdate => match updater::apply_prepared() {
-                        Ok(version) => {
-                            tracing::info!(%version, "restarting into the staged update");
-                            let _ = update_events.try_send(UpdateEvent::Restarting(version));
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "could not start the Bridge update");
-                            let _ =
-                                update_events.try_send(UpdateEvent::Failed(format!("{error:#}")));
-                        }
-                    },
+                    // Queued behind a download still running, as before, so
+                    // it restarts into what that download stages.
+                    BridgeCommand::ApplyUpdate => {
+                        let _ = update_jobs.send(UpdateJob::Apply);
+                    }
                     BridgeCommand::ForgetBattery(device_id) => {
                         command_service.forget_battery(&device_id).await;
                     }
@@ -497,22 +543,6 @@ fn run_server(
             }
         });
 
-        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BRIDGE_PORT);
-        let listener = match TcpListener::bind(address).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                // The first launch still holds 17846. Ask it to open the panel
-                // instead of exiting with nothing on screen.
-                if activate_running_bridge().await {
-                    tracing::info!("OpenMouse Bridge is already running; opening its tray panel");
-                    let _ = ready.send(Ok(Startup::AlreadyRunning));
-                    return Ok(());
-                }
-                return Err(error).context(format!(
-                    "could not bind http://{address}; is Bridge already running?"
-                ));
-            }
-        };
         tracing::info!(%address, config = %path.display(), "OpenMouse Bridge is ready");
         // Only now is this the one Bridge running, so nothing else can be
         // about to apply a download this removes.
@@ -535,12 +565,60 @@ fn run_server(
         if let Some(focus) = focus {
             let _ = tokio::task::spawn_blocking(move || drop(focus)).await;
         }
+        catalog_refresh.abort();
         snapshot_publisher.abort();
         update_timer.abort();
         command_handler.abort();
+        update_worker.abort();
         outcome?;
         Ok(())
-    })
+    });
+    // Dropping the runtime waits for every blocking task still running,
+    // which held up quitting, restarting, the "already running" exit and the
+    // update hand-off. The update helper is already started by then.
+    runtime.shutdown_timeout(SHUTDOWN_GRACE);
+    outcome
+}
+
+/// Update work the tray asks for, run one at a time by [`run_update_job`].
+enum UpdateJob {
+    Check {
+        install_automatically: bool,
+    },
+    Install(UpdateInfo),
+    /// Restart into the staged update.
+    Apply,
+}
+
+async fn run_update_job(job: UpdateJob, events: SyncSender<UpdateEvent>) {
+    match job {
+        UpdateJob::Check {
+            install_automatically,
+        } => check_for_updates(install_automatically, &events).await,
+        UpdateJob::Install(update) => install_update(update, &events).await,
+        UpdateJob::Apply => match updater::apply_prepared() {
+            Ok(version) => {
+                tracing::info!(%version, "restarting into the staged update");
+                let _ = events.try_send(UpdateEvent::Restarting(version));
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not start the Bridge update");
+                let _ = events.try_send(UpdateEvent::Failed(format!("{error:#}")));
+            }
+        },
+    }
+}
+
+/// Runs each queued job to completion before starting the next, in the order
+/// queued, until every sender is gone.
+async fn run_serially<J, F, Fut>(mut jobs: tokio_mpsc::UnboundedReceiver<J>, mut run: F)
+where
+    F: FnMut(J) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    while let Some(job) = jobs.recv().await {
+        run(job).await;
+    }
 }
 
 /// Checks `latest.json`. With `install_automatically`, an update this install
@@ -733,6 +811,40 @@ mod tests {
     fn a_clock_set_backwards_is_not_a_resume() {
         let now = SystemTime::now();
         assert_eq!(resume_gap(now + Duration::from_secs(3600), now), None);
+    }
+
+    #[tokio::test]
+    async fn update_jobs_run_one_at_a_time_in_the_order_queued() {
+        let (jobs, queued) = tokio_mpsc::unbounded_channel();
+        let (log_tx, mut log) = tokio_mpsc::unbounded_channel::<String>();
+        let worker = tokio::spawn(run_serially(
+            queued,
+            move |(name, gate): (&'static str, oneshot::Receiver<()>)| {
+                let log = log_tx.clone();
+                async move {
+                    let _ = log.send(format!("start {name}"));
+                    let _ = gate.await;
+                    let _ = log.send(format!("end {name}"));
+                }
+            },
+        ));
+        let quiet = Duration::from_millis(50);
+        let (open_first, first) = oneshot::channel();
+        let (open_second, second) = oneshot::channel();
+        // Queuing never waits for the job ahead to finish.
+        jobs.send(("first", first)).unwrap();
+        jobs.send(("second", second)).unwrap();
+        assert_eq!(log.recv().await.as_deref(), Some("start first"));
+        assert!(tokio::time::timeout(quiet, log.recv()).await.is_err());
+        // A later job that could finish still waits for the one ahead.
+        open_second.send(()).unwrap();
+        assert!(tokio::time::timeout(quiet, log.recv()).await.is_err());
+        open_first.send(()).unwrap();
+        for expected in ["end first", "start second", "end second"] {
+            assert_eq!(log.recv().await.as_deref(), Some(expected));
+        }
+        drop(jobs);
+        worker.await.unwrap();
     }
 
     #[test]
