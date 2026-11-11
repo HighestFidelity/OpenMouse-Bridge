@@ -1,0 +1,8 @@
+# The Rust release CI and local builds use. Bump on purpose (and rust-version
+# in Cargo.toml and the dtolnay/rust-toolchain `toolchain:` inputs in
+# .github/workflows with it), so a new stable lint cannot break CI on an
+# unrelated change.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
