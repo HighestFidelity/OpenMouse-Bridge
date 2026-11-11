@@ -34,6 +34,24 @@ jobs:
       # and CHANGELOG.md disagree.
       - name: Verify tag matches Cargo version
         run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
+      # A release without code signing must not ship (audit N9): fail here
+      # instead of publishing unsigned builds. Only whether the secrets exist
+      # is read, never their values.
+      - name: Require signing secrets
+        env:
+          HAS_WINDOWS_SIGNING: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
+          HAS_MAC_SIGNING: ${{ secrets.MACOS_CERTIFICATE_BASE64 != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
+        run: |
+          missing=0
+          if [ "$HAS_WINDOWS_SIGNING" != true ]; then
+            echo '::error::WINDOWS_CERTIFICATE_BASE64 / WINDOWS_CERTIFICATE_PASSWORD are not set; refusing to ship unsigned Windows builds.'
+            missing=1
+          fi
+          if [ "$HAS_MAC_SIGNING" != true ]; then
+            echo '::error::MACOS_CERTIFICATE_BASE64 / MACOS_SIGN_IDENTITY are not set; refusing to ship ad-hoc signed macOS builds.'
+            missing=1
+          fi
+          exit "$missing"
       - name: Verify CHANGELOG.md has an entry for this version
         run: |
           node --input-type=module -e '
@@ -155,7 +173,7 @@ jobs:
     needs: preflight
     runs-on: macos-15
     # Signing and notarization are automatic when these secrets exist;
-    # without them the app is ad-hoc signed.
+    # preflight refuses to release without the signing ones (audit N9).
     # The flags say whether the secrets exist; the secrets themselves are
     # passed only to the steps that use them.
     env:
@@ -458,16 +476,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Re-cutting a tag replaces the assets and notes of the existing
-          # release instead of deleting it, so the release is never missing.
+          # Never overwrite what a tag already published (audit N9): a re-run
+          # may add assets that are missing, but an asset that exists makes
+          # the upload fail. To re-cut, delete the release by hand or bump the
+          # version.
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber artifacts/* release/latest.json
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" artifacts/* release/latest.json
             gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file release/notes.md
           else
+            # Pre-release tags (v1.2.0-rc.1) are never latest, so the
+            # updater's releases/latest/download/latest.json skips them.
+            prerelease="$(node --input-type=module -e '
+              import { isPrerelease } from "./.github/scripts/make-release-files.mjs";
+              console.log(isPrerelease(process.argv[1]));
+            ' "$GITHUB_REF_NAME")"
+            if [ "$prerelease" = true ]; then
+              channel=(--prerelease --latest=false)
+            else
+              channel=(--latest)
+            fi
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --notes-file release/notes.md \
-              --latest \
+              "${channel[@]}" \
               artifacts/* release/latest.json
           fi

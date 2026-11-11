@@ -35,6 +35,15 @@ export function versionFromTag(tag) {
 }
 
 /**
+ * Whether a tag is a semver pre-release (`v1.2.0-rc.1`, `v1.2.0-beta.3`).
+ * Those are published as GitHub pre-releases and never marked latest, so the
+ * in-app updater (releases/latest/download/latest.json) never offers them.
+ */
+export function isPrerelease(tag) {
+  return versionFromTag(tag).includes("-");
+}
+
+/**
  * The body of `## <version>` in a changelog: everything up to the next `## `
  * heading, trimmed. A heading may add a date after the version
  * (`## 1.0.0 - 2026-11-20`). Throws when there is no entry or it is empty.

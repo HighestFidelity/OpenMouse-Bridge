@@ -12,6 +12,7 @@ import {
   PLATFORM_ASSETS,
   buildLatest,
   changelogEntry,
+  isPrerelease,
   versionFromTag,
 } from "./make-release-files.mjs";
 
@@ -38,6 +39,13 @@ test("tags become versions", () => {
   assert.equal(versionFromTag("1.2.3-beta.4"), "1.2.3-beta.4");
   assert.throws(() => versionFromTag("dev-build"));
   assert.throws(() => versionFromTag("v1.0"));
+});
+
+test("pre-release tags are told apart from stable ones", () => {
+  assert.equal(isPrerelease("v1.2.0"), false);
+  assert.equal(isPrerelease("v1.2.0-rc.1"), true);
+  assert.equal(isPrerelease("1.0.0-beta.21"), true);
+  assert.throws(() => isPrerelease("latest"));
 });
 
 test("the entry for a version is its section, without neighbours", () => {
