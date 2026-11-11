@@ -28,4 +28,4 @@
   locally (4 cases ok); with a key built in, the stub-completion test fails on the missing .sig as it should. The latest.json path
   has no end-to-end test (review only).
 
-NEXT: Victor pushes main via docker exec into claude-code-app. Open: N4-N8, N10-N12 (his calls); N1 activation (key) when he wants.
+NEXT: main pushed at dd49d0f (ls-remote verified 2026-11-11). Open: N4-N8, N10-N12 (his calls); N1 activation (key) when he wants.
