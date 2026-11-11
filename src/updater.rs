@@ -86,33 +86,7 @@ struct ReleaseAsset {
 /// release is newer than the running Bridge.
 pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
     let url = env::var(feed::FEED_URL_ENV).unwrap_or_else(|_| feed::LATEST_JSON_URL.to_owned());
-    let client = reqwest::Client::builder()
-        .timeout(CHECK_TIMEOUT)
-        .build()
-        .context("could not create the update client")?;
-    let response = client
-        .get(&url)
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .send()
-        .await
-        .with_context(|| format!("could not check {url}"))?
-        .error_for_status()
-        .with_context(|| format!("update check failed for {url}"))?;
-    let bytes = read_bounded_response(response, MAX_RELEASE_BYTES).await?;
-    if let Some(key) = signature::configured_key()? {
-        let signature_url = format!("{url}{}", signature::SIGNATURE_SUFFIX);
-        let signature = download(
-            &client,
-            &signature_url,
-            signature::MAX_SIGNATURE_BYTES,
-            false,
-        )
-        .await
-        .context("latest.json has no signature; refusing the update")?;
-        signature::verify(&key, &bytes, &signature, "latest.json")?;
-    }
-    let latest: feed::Feed =
-        serde_json::from_slice(&bytes).context("could not parse latest.json")?;
+    let latest = fetch_feed(&url, signature::configured_key()?).await?;
     let kind = feed::current_install_kind();
     Ok(
         match feed::offer(&latest, crate::BRIDGE_VERSION, kind.as_ref())? {
@@ -132,6 +106,37 @@ pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
             }),
         },
     )
+}
+
+/// Downloads and parses `latest.json`. With a signing `key`, `<url>.sig` must
+/// be a valid signature over the exact bytes downloaded.
+async fn fetch_feed(url: &str, key: Option<[u8; 32]>) -> Result<feed::Feed> {
+    let client = reqwest::Client::builder()
+        .timeout(CHECK_TIMEOUT)
+        .build()
+        .context("could not create the update client")?;
+    let response = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .send()
+        .await
+        .with_context(|| format!("could not check {url}"))?
+        .error_for_status()
+        .with_context(|| format!("update check failed for {url}"))?;
+    let bytes = read_bounded_response(response, MAX_RELEASE_BYTES).await?;
+    if let Some(key) = key {
+        let signature_url = format!("{url}{}", signature::SIGNATURE_SUFFIX);
+        let signature = download(
+            &client,
+            &signature_url,
+            signature::MAX_SIGNATURE_BYTES,
+            false,
+        )
+        .await
+        .context("latest.json has no signature; refusing the update")?;
+        signature::verify(&key, &bytes, &signature, "latest.json")?;
+    }
+    serde_json::from_slice(&bytes).context("could not parse latest.json")
 }
 
 /// The release to finish a stub install with: the latest one, even when it is
