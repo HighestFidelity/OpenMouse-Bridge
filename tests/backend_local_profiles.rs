@@ -45,7 +45,9 @@ async fn server_with_config(storage_failure: bool, config: BridgeConfig) -> Test
     let url = format!("http://{}", listener.local_addr().unwrap());
     let router = api::router(service.clone(), &[]);
     let task = tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(listener, api::make_service(router))
+            .await
+            .unwrap();
     });
     TestServer {
         url,
