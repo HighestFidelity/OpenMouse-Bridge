@@ -16,3 +16,5 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   fmt/test/clippy and the script tests on every PR, protocol-only ones included.
 - t3/release-safety (P9-OMB4, N9 -> F18): release.yml refuses to release without signing secrets, never
   overwrites published assets, publishes pre-release tags as pre-releases (not latest).
+- t3/update-signing (P9-OMB5, N1): ed25519 signature checks on update metadata (latest.json.sig,
+  <archive>.sha256.sig) and CI signing with UPDATE_SIGNING_KEY. Off until a public key is built in.

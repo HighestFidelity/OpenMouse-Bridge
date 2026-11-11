@@ -24,4 +24,8 @@
 - Side effect: with N9 the fork cannot cut a release without Windows/macOS signing certs.
 - N1 design question to Victor: the updater reads upstream's feed (OpenMouse-Project), which is unsigned; verifying a fork key fail-closed stops fork builds auto-updating from upstream.
 
-NEXT: P9-OMB5 N1 once Victor picks the feed/key option; then Victor pushes main via docker exec into claude-code-app.
+- N1 merged as ready-but-off (b688f2c, Victor picked it 23:05 PT): cargo test 268+39+11, fmt, clippy clean; CI sign step simulated
+  locally (4 cases ok); with a key built in, the stub-completion test fails on the missing .sig as it should. The latest.json path
+  has no end-to-end test (review only).
+
+NEXT: Victor pushes main via docker exec into claude-code-app. Open: N4-N8, N10-N12 (his calls); N1 activation (key) when he wants.
