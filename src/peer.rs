@@ -7,34 +7,58 @@
 //! keep the Origin checks alone.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{extract::connect_info::Connected, serve::IncomingStream};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::OnceCell};
 
-/// Both ends of an accepted connection, as the server saw them.
-#[derive(Clone, Copy, Debug)]
+/// Both ends of an accepted connection, as the server saw them, plus the
+/// connection's peer verdict. axum builds this once per accepted connection
+/// and clones it into every request on it, so the clones share one verdict.
+#[derive(Clone, Debug)]
 pub struct Connection {
-    pub peer: SocketAddr,
+    peer: SocketAddr,
     /// The listening address the client connected to; `None` if the socket
     /// could not report it, which the Linux check refuses.
-    pub local: Option<SocketAddr>,
+    local: Option<SocketAddr>,
+    /// The first completed check, reused by every later request on this
+    /// connection. Stays unset if that check was cancelled.
+    verdict: Arc<OnceCell<bool>>,
+}
+
+impl Connection {
+    pub fn new(peer: SocketAddr, local: Option<SocketAddr>) -> Self {
+        Self {
+            peer,
+            local,
+            verdict: Arc::default(),
+        }
+    }
+
+    /// Whether the client end of this connection belongs to this process's
+    /// uid. The socket table is read for the first request only: a TCP
+    /// connection keeps its owner, so later requests reuse the answer.
+    #[cfg(target_os = "linux")]
+    pub async fn same_user(&self) -> bool {
+        *self
+            .verdict
+            .get_or_init(|| same_user(self.peer, self.local))
+            .await
+    }
 }
 
 impl Connected<IncomingStream<'_, TcpListener>> for Connection {
     fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
-        Self {
-            peer: *stream.remote_addr(),
-            local: stream.io().local_addr().ok(),
-        }
+        Self::new(*stream.remote_addr(), stream.io().local_addr().ok())
     }
 }
 
-/// Whether the client end of `connection` belongs to this process's uid.
-/// Fails closed: an unreadable table or a missing entry is a refusal.
+/// Whether the socket whose local end is `peer` and remote end is `local`
+/// belongs to this process's uid. Fails closed: an unknown listening
+/// address, an unreadable table or a missing entry is a refusal.
 #[cfg(target_os = "linux")]
-pub async fn same_user(connection: Connection) -> bool {
-    let Some(local) = connection.local else {
+async fn same_user(peer: SocketAddr, local: Option<SocketAddr>) -> bool {
+    let Some(local) = local else {
         tracing::warn!("Refused API connection: listening address unknown");
         return false;
     };
@@ -50,14 +74,14 @@ pub async fn same_user(connection: Connection) -> bool {
     let tcp6 = tcp6.unwrap_or_default();
     // SAFETY: getuid has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
-    match owner_uid([tcp.as_str(), tcp6.as_str()], connection.peer, local) {
+    match owner_uid([tcp.as_str(), tcp6.as_str()], peer, local) {
         Some(owner) if owner == uid => true,
         Some(owner) => {
-            tracing::warn!(peer = %connection.peer, owner, "Refused API connection from another account");
+            tracing::warn!(%peer, owner, "Refused API connection from another account");
             false
         }
         None => {
-            tracing::warn!(peer = %connection.peer, "Refused API connection: client socket not found");
+            tracing::warn!(%peer, "Refused API connection: client socket not found");
             false
         }
     }
@@ -220,21 +244,39 @@ mod tests {
         let client = tokio::net::TcpStream::connect(server).await.unwrap();
         let (_accepted, peer) = listener.accept().await.unwrap();
         assert_eq!(peer, client.local_addr().unwrap());
-        assert!(
-            same_user(Connection {
-                peer,
-                local: Some(server)
-            })
-            .await
-        );
-        // A connection that does not exist is refused.
-        assert!(
-            !same_user(Connection {
-                peer: addr(1),
-                local: Some(server)
-            })
-            .await
-        );
-        assert!(!same_user(Connection { peer, local: None }).await);
+        assert!(Connection::new(peer, Some(server)).same_user().await);
+        // A connection that does not exist is refused, and so is one whose
+        // listening address is unknown.
+        assert!(!Connection::new(addr(1), Some(server)).same_user().await);
+        assert!(!Connection::new(peer, None).same_user().await);
+    }
+
+    /// Later requests on a connection reuse the first verdict instead of
+    /// reading the socket table again.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn verdict_is_checked_once_per_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(server).await.unwrap();
+        let (_accepted, peer) = listener.accept().await.unwrap();
+
+        let allowed = Connection::new(peer, Some(server));
+        assert_eq!(allowed.verdict.get(), None);
+        assert!(allowed.same_user().await);
+        assert_eq!(allowed.verdict.get(), Some(&true));
+        // The next request gets a clone. Point it at a socket a fresh table
+        // read would refuse: the cached answer proves there was no re-read.
+        let mut next_request = allowed.clone();
+        next_request.peer = addr(1);
+        assert!(next_request.same_user().await);
+
+        // A refusal sticks the same way.
+        let refused = Connection::new(addr(1), Some(server));
+        assert!(!refused.same_user().await);
+        let mut next_request = refused.clone();
+        next_request.peer = peer;
+        assert!(!next_request.same_user().await);
+        assert_eq!(refused.verdict.get(), Some(&false));
     }
 }
