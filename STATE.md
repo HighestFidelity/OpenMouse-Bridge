@@ -28,4 +28,12 @@
   locally (4 cases ok); with a key built in, the stub-completion test fails on the missing .sig as it should. The latest.json path
   has no end-to-end test (review only).
 
-NEXT: main pushed at dd49d0f (ls-remote verified 2026-11-11). Open: N4-N8, N10-N12 (his calls); N1 activation (key) when he wants.
+
+## 2026-11-11 Update (P9-OMB6..9)
+- N12 partial (408fd2e), signed-feed e2e test (30be774). Victor: N4/N5/N10/N11 stay (23:50 PT).
+- Windows check on the box (Victor approved): rustup target x86_64-pc-windows-gnu + apt gcc-mingw-w64-x86-64. On 441bfc0
+  `cargo check` and `cargo clippy --all-targets --target x86_64-pc-windows-gnu -D warnings` are clean
+  (CARGO_TARGET_DIR=/home/claude/workspace/temp/omb-target-win). CI uses MSVC; macOS still unchecked.
+- P9-OMB9: brainstorm agent writing reports/improvement-ideas.md; triage into tasks next.
+
+NEXT: triage reports/improvement-ideas.md (P9-OMB9); Victor pushes main (ahead of dd49d0f). Open: N4-N8, N10-N12 (his calls); N1 activation (key) when he wants.
