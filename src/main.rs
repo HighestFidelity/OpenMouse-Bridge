@@ -72,7 +72,7 @@ async fn run() -> Result<()> {
         .await
         .with_context(|| format!("could not bind http://{address}; is Bridge already running?"))?;
     tracing::info!(%address, config = %path.display(), "OpenMouse Bridge is ready");
-    axum::serve(listener, api::router(service, &origins))
+    axum::serve(listener, api::make_service(api::router(service, &origins)))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())

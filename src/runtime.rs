@@ -525,7 +525,7 @@ fn run_server(
             .await
             .ok()
             .flatten();
-        let outcome = axum::serve(listener, api::router(service, &origins))
+        let outcome = axum::serve(listener, api::make_service(api::router(service, &origins)))
             .with_graceful_shutdown(async {
                 let _ = shutdown.await;
             })

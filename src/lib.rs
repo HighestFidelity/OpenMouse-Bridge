@@ -11,6 +11,7 @@ pub mod hid_access;
 #[cfg(target_os = "linux")]
 pub mod kwin_focus;
 pub mod local_targets;
+pub mod peer;
 pub mod platform;
 pub mod remote_image;
 pub mod service;

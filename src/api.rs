@@ -165,7 +165,39 @@ async fn request_gate(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // Covers every route, the HID WebSocket included (audit N3).
+    #[cfg(target_os = "linux")]
+    if !peer_is_this_user(
+        request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<crate::peer::Connection>>()
+            .map(|info| info.0),
+    )
+    .await
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     next.run(request).await
+}
+
+/// Linux: the client socket must belong to this account. Requests without
+/// connection info (a server not started through [`make_service`]) are
+/// refused, except in this crate's unit tests, which drive the router
+/// directly.
+#[cfg(target_os = "linux")]
+async fn peer_is_this_user(connection: Option<crate::peer::Connection>) -> bool {
+    match connection {
+        Some(connection) => crate::peer::same_user(connection).await,
+        None => cfg!(test),
+    }
+}
+
+/// The router as a service that records each connection's addresses, which
+/// the request gate needs. Serve the API through this.
+pub fn make_service(
+    router: Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, crate::peer::Connection> {
+    router.into_make_service_with_connect_info::<crate::peer::Connection>()
 }
 
 async fn hid_upgrade(
@@ -532,6 +564,29 @@ mod tests {
             .expect("body")
             .to_vec();
         (status, bytes, kind)
+    }
+
+    /// Linux: a request whose client socket is not ours (here: not in
+    /// /proc/net/tcp at all) is refused, HID WebSocket included.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unknown_peer_socket_is_refused() {
+        let (app, dir) = app();
+        let unknown = crate::peer::Connection {
+            peer: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            local: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9))),
+        };
+        for uri in ["/v1/status", "/v1/hid"] {
+            let request = Request::builder()
+                .uri(uri)
+                .header(header::HOST, "127.0.0.1:17846")
+                .extension(axum::extract::ConnectInfo(unknown))
+                .body(Body::empty())
+                .expect("request");
+            let response = app.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
