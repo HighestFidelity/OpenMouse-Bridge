@@ -1,4 +1,7 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -360,23 +363,71 @@ pub fn log_dir() -> Result<PathBuf> {
     Ok(parent.join("logs"))
 }
 
-pub fn load_or_create() -> Result<(BridgeConfig, PathBuf)> {
+/// Loads config.json, or creates it with defaults. The last value is where an
+/// unparsable config.json was set aside (see [`load_or_recover`]).
+pub fn load_or_create() -> Result<(BridgeConfig, PathBuf, Option<PathBuf>)> {
     let path = config_path()?;
-    if path.exists() {
-        let bytes =
-            fs::read(&path).with_context(|| format!("could not read {}", path.display()))?;
-        let config = serde_json::from_slice::<BridgeConfig>(&bytes)
-            .with_context(|| format!("could not parse {}", path.display()))?
-            .normalized();
-        return Ok((config, path));
-    }
+    let (config, set_aside) = load_or_recover(&path)?;
+    Ok((config, path, set_aside))
+}
+
+/// Loads `path`, or creates it with defaults. A file that is not valid config
+/// JSON (a crash mid-write on an old build, a bad hand edit) is renamed to
+/// `<name>.bad-<unix seconds>` and replaced with defaults, so Bridge still
+/// starts; the new name is returned so the user can be told. A file that
+/// cannot be read, or cannot be moved aside, is still an error: nothing is
+/// replaced unless the old bytes are kept.
+fn load_or_recover(path: &Path) -> Result<(BridgeConfig, Option<PathBuf>)> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let config = BridgeConfig::default();
+            save(path, &config)?;
+            return Ok((config, None));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", path.display()));
+        }
+    };
+    let parse_error = match serde_json::from_slice::<BridgeConfig>(&bytes) {
+        Ok(config) => return Ok((config.normalized(), None)),
+        Err(error) => error,
+    };
+    let aside = set_aside_path(path);
+    fs::rename(path, &aside).with_context(|| {
+        format!(
+            "could not parse {} ({parse_error}) or move it aside to {}",
+            path.display(),
+            aside.display()
+        )
+    })?;
+    tracing::warn!(
+        error = %parse_error,
+        kept = %aside.display(),
+        "config.json could not be parsed; set it aside and started on defaults"
+    );
     let config = BridgeConfig::default();
-    save(&path, &config)?;
-    Ok((config, path))
+    save(path, &config)?;
+    Ok((config, Some(aside)))
+}
+
+/// `<path>.bad-<unix seconds>`, with `-1`, `-2`, ... added if that is taken.
+fn set_aside_path(path: &Path) -> PathBuf {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let base = format!("{}.bad-{seconds}", path.display());
+    let mut candidate = PathBuf::from(&base);
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = PathBuf::from(format!("{base}-{n}"));
+        n += 1;
+    }
+    candidate
 }
 
 pub async fn load_with_catalog() -> Result<(BridgeConfig, PathBuf)> {
-    let (mut config, path) = load_or_create()?;
+    let (mut config, path, _set_aside) = load_or_create()?;
     match crate::games::fetch_catalog().await {
         Ok(games) => {
             apply_fetched_catalog(&path, &mut config, games);
@@ -501,6 +552,98 @@ fn default_origins() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("openmouse-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// BridgeConfig has no PartialEq; compare what would be saved.
+    fn is_default(config: &BridgeConfig) -> bool {
+        serde_json::to_value(config).unwrap()
+            == serde_json::to_value(BridgeConfig::default()).unwrap()
+    }
+
+    fn set_aside_files(dir: &Path) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().contains(".bad-"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn a_missing_config_is_created_with_defaults() {
+        let dir = scratch_dir("config-missing");
+        let path = dir.join("config.json");
+        let (config, set_aside) = load_or_recover(&path).unwrap();
+        assert!(is_default(&config));
+        assert_eq!(set_aside, None);
+        assert!(path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_valid_config_loads_untouched() {
+        let dir = scratch_dir("config-valid");
+        let path = dir.join("config.json");
+        let saved = BridgeConfig {
+            battery_threshold_percent: 42,
+            ..BridgeConfig::default()
+        };
+        save(&path, &saved).unwrap();
+        let (config, set_aside) = load_or_recover(&path).unwrap();
+        assert_eq!(config.battery_threshold_percent, 42);
+        assert_eq!(set_aside, None);
+        assert!(set_aside_files(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unparsable_config_is_kept_aside_and_defaults_are_used() {
+        let dir = scratch_dir("config-bad");
+        let path = dir.join("config.json");
+        fs::write(&path, b"{\"battery_threshold_percent\": 4").unwrap();
+        let (config, set_aside) = load_or_recover(&path).unwrap();
+        assert!(is_default(&config));
+        let aside = set_aside.expect("the bad file is set aside");
+        assert_eq!(
+            fs::read(&aside).unwrap(),
+            b"{\"battery_threshold_percent\": 4"
+        );
+        let rewritten: BridgeConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(is_default(&rewritten));
+
+        // A second bad file in the same second gets its own name.
+        fs::write(&path, b"not json").unwrap();
+        let (_, second) = load_or_recover(&path).unwrap();
+        let second = second.unwrap();
+        assert_ne!(second, aside);
+        assert_eq!(fs::read(&second).unwrap(), b"not json");
+        assert_eq!(set_aside_files(&dir), {
+            let mut both = vec![aside, second];
+            both.sort();
+            both
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_config_is_an_error_and_nothing_is_replaced() {
+        let dir = scratch_dir("config-unreadable");
+        // A directory where config.json should be: reading it fails with
+        // something other than "not found".
+        let path = dir.join("config.json");
+        fs::create_dir(&path).unwrap();
+        assert!(load_or_recover(&path).is_err());
+        assert!(path.is_dir());
+        assert!(set_aside_files(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn catalog_game(name: &str) -> GameConfig {
         GameConfig {

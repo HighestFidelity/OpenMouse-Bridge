@@ -394,7 +394,17 @@ fn run_server(
                 ));
             }
         };
-        let (bridge_config, path) = config::load_or_create()?;
+        let (bridge_config, path, set_aside) = config::load_or_create()?;
+        if let Some(kept) = set_aside {
+            // Queued for the tray, which shows it once it is up.
+            let _ = notices.send(Notice {
+                title: "Bridge settings were reset".into(),
+                detail: format!(
+                    "config.json could not be read, so Bridge started on defaults. The old file is kept as {}",
+                    kept.display()
+                ),
+            });
+        }
         let show_panel = !bridge_config.tray_hint_shown;
         let automatic_updates = bridge_config.automatic_updates;
         let origins = bridge_config.allowed_origins.clone();
