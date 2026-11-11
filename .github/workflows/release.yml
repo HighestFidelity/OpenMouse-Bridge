@@ -483,7 +483,7 @@ jobs:
           mkdir release
           node .github/scripts/make-release-files.mjs "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" artifacts release
           cat release/latest.json
-      # Signs latest.json and every .sha256 with UPDATE_SIGNING_KEY (an
+      # Signs latest.json and every .sha256 (with its tag) using UPDATE_SIGNING_KEY (an
       # ed25519 PEM) as raw 64-byte .sig files, which src/updater/signature.rs
       # checks against its built-in public key. The key must match that one.
       - name: Sign the update metadata
@@ -511,10 +511,20 @@ jobs:
             echo '::error::UPDATE_SIGNING_KEY does not match UPDATE_PUBLIC_KEY_HEX in src/updater/signature.rs.'
             exit 1
           fi
-          for file in release/latest.json artifacts/*.sha256; do
-            openssl pkeyutl -sign -rawin -inkey "$key" -in "$file" -out "$file.sig"
-            openssl pkeyutl -verify -rawin -pubin -inkey "$public" -in "$file" -sigfile "$file.sig"
+          sign() {
+            openssl pkeyutl -sign -rawin -inkey "$key" -in "$1" -out "$2"
+            openssl pkeyutl -verify -rawin -pubin -inkey "$public" -in "$1" -sigfile "$2"
+          }
+          sign release/latest.json release/latest.json.sig
+          # A checksum signature covers a context line and the tag too
+          # (signature::checksum_message), so it cannot be replayed under
+          # another release.
+          message="$RUNNER_TEMP/checksum-message"
+          for file in artifacts/*.sha256; do
+            { printf 'openmouse-bridge checksum v1\n%s\n' "$GITHUB_REF_NAME"; cat "$file"; } > "$message"
+            sign "$message" "$file.sig"
           done
+          rm -f "$message"
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1176,3 +1176,17 @@ fn stale_download_cleanup_removes_only_matching_entries() {
     assert!(elsewhere.join("precious").exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn checksum_files_name_their_archive() {
+    assert_eq!(
+        checksum_file_name(b"abc  openmouse-bridge-linux-x64-full.zip\n"),
+        Some("openmouse-bridge-linux-x64-full.zip")
+    );
+    assert_eq!(
+        checksum_file_name(b"abc *openmouse-bridge-macos-app.zip\r\n"),
+        Some("openmouse-bridge-macos-app.zip")
+    );
+    assert_eq!(checksum_file_name(b"abc"), None);
+    assert_eq!(checksum_file_name(b"abc a.zip b.zip"), None);
+}

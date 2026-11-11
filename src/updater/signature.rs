@@ -20,6 +20,19 @@ pub(super) const UPDATE_PUBLIC_KEY_HEX: &str = "";
 /// Appended to a metadata file's URL or asset name to find its signature.
 pub(super) const SIGNATURE_SUFFIX: &str = ".sig";
 
+/// First line of what a `.sha256.sig` signs. The tag on the next line binds
+/// the checksum to its release, so an older release's signed checksum cannot
+/// be replayed under a newer tag (downgrade).
+const CHECKSUM_CONTEXT: &str = "openmouse-bridge checksum v1";
+
+/// The bytes a `<archive>.sha256.sig` signs: context line, release tag, then
+/// the checksum file as published. release.yml builds the same bytes.
+pub(super) fn checksum_message(tag: &str, checksum_file: &[u8]) -> Vec<u8> {
+    let mut message = format!("{CHECKSUM_CONTEXT}\n{tag}\n").into_bytes();
+    message.extend_from_slice(checksum_file);
+    message
+}
+
 /// Largest signature file read; a raw ed25519 signature is 64 bytes.
 pub(super) const MAX_SIGNATURE_BYTES: usize = 1024;
 
@@ -77,6 +90,35 @@ mod tests {
     #[test]
     fn the_built_in_key_is_empty_or_valid() {
         configured_key().expect("UPDATE_PUBLIC_KEY_HEX must be empty or 64 hex digits");
+    }
+
+    #[test]
+    fn checksum_signatures_are_bound_to_their_tag() {
+        let pair = key_pair();
+        let key = public(&pair);
+        let file = b"abc  openmouse-bridge-linux-x64-full.zip\n";
+        let signature = pair.sign(&checksum_message("v1.0.0", file));
+        verify(
+            &key,
+            &checksum_message("v1.0.0", file),
+            signature.as_ref(),
+            "x",
+        )
+        .unwrap();
+        // The same signed checksum replayed under a newer tag is refused.
+        assert!(
+            verify(
+                &key,
+                &checksum_message("v1.0.1", file),
+                signature.as_ref(),
+                "x"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            checksum_message("v1.0.0", b"abc"),
+            b"openmouse-bridge checksum v1\nv1.0.0\nabc".to_vec()
+        );
     }
 
     #[test]
