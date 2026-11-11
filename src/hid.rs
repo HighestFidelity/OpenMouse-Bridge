@@ -409,6 +409,84 @@ impl ReaderHandle {
     }
 }
 
+/// What a reader handle must share with the command handle of the same path:
+/// both handles have to reach the same physical interface.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[derive(Debug, PartialEq)]
+struct HandleIdentity {
+    vendor_id: u16,
+    product_id: u16,
+    serial: Option<String>,
+    interface: i32,
+    descriptor: Vec<u8>,
+}
+
+/// Reads the identity from the open handle itself (on Linux, from the hidraw
+/// node the fd refers to), never from the path it was opened by.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn handle_identity(device: &HidDevice) -> Result<HandleIdentity, String> {
+    let info = device
+        .get_device_info()
+        .map_err(|error| error.to_string())?;
+    let mut descriptor = vec![0; MAX_REPORT_DESCRIPTOR_SIZE];
+    let size = device
+        .get_report_descriptor(&mut descriptor)
+        .map_err(|error| error.to_string())?;
+    descriptor.truncate(size);
+    Ok(HandleIdentity {
+        vendor_id: info.vendor_id(),
+        product_id: info.product_id(),
+        serial: info.serial_number().map(str::to_owned),
+        interface: info.interface_number(),
+        descriptor,
+    })
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn has_security_key_collection(collections: &[CollectionInfo]) -> bool {
+    collections.iter().any(|collection| {
+        collection.usage_page == FIDO_USAGE_PAGE
+            || has_security_key_collection(&collection.children)
+    })
+}
+
+/// The reader opens its path again after `open` checked it. If the node was
+/// replaced in between (unplug and replug, or a security key that took the
+/// same hidraw number), the new handle reaches another device: refuse it
+/// unless it matches the command handle, and never accept a FIDO collection.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn check_reader_identity(expected: &HandleIdentity, actual: &HandleIdentity) -> Result<(), String> {
+    let security_key = parse_report_descriptor(&actual.descriptor)
+        .is_ok_and(|(collections, _)| has_security_key_collection(&collections));
+    if security_key {
+        return Err("the HID input reader reached a security key; refused".into());
+    }
+    if expected != actual {
+        return Err(
+            "the HID interface changed before its input reader opened; reopen the device".into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn open_verified_reader(api: &HidApi, path: &OpenPath) -> Result<HidDevice, String> {
+    let reader = api
+        .open_path(&path.path)
+        .map_err(|error| format!("could not open HID input reader: {error}"))?;
+    let command = path
+        .device
+        .lock()
+        .map_err(|_| "native HID lock was poisoned".to_owned())?;
+    let expected = handle_identity(&command)
+        .map_err(|error| format!("could not identify the HID interface: {error}"))?;
+    drop(command);
+    let actual = handle_identity(&reader)
+        .map_err(|error| format!("could not identify the HID input reader: {error}"))?;
+    check_reader_identity(&expected, &actual)?;
+    Ok(reader)
+}
+
 /// One input reader thread's loop: forwards each report `read` returns until
 /// the stop flag is set, the session's input queue rejects a report, or the
 /// read fails. `read` returns 0 when nothing arrived within its timeout, so
@@ -925,10 +1003,7 @@ impl HidSession {
                 .iter()
                 .map(|path| {
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
-                    let device =
-                        ReaderHandle::Owned(self.api.open_path(&path.path).map_err(|error| {
-                            format!("could not open HID input reader: {error}")
-                        })?);
+                    let device = ReaderHandle::Owned(open_verified_reader(&self.api, path)?);
                     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                     let device = ReaderHandle::Shared(Arc::clone(&path.device));
                     Ok((
@@ -2169,6 +2244,46 @@ mod tests {
         );
         assert!(stop.load(Ordering::Acquire));
         assert!(*failure.borrow());
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn a_reader_handle_that_reaches_another_device_is_refused() {
+        let mouse_descriptor = vec![
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x08, 0x75, 0x08, 0x95, 0x10, 0x81, 0x02,
+            0xc0,
+        ];
+        let identity = |descriptor: Vec<u8>| HandleIdentity {
+            vendor_id: 0x1532,
+            product_id: 0x00b6,
+            serial: Some("A1".into()),
+            interface: 2,
+            descriptor,
+        };
+        let expected = identity(mouse_descriptor.clone());
+        assert!(check_reader_identity(&expected, &identity(mouse_descriptor.clone())).is_ok());
+
+        // Same interface number, another device behind the reused node.
+        let mut other = identity(mouse_descriptor.clone());
+        other.product_id = 0x0083;
+        assert!(check_reader_identity(&expected, &other).is_err());
+        let mut other = identity(mouse_descriptor.clone());
+        other.serial = Some("B2".into());
+        assert!(check_reader_identity(&expected, &other).is_err());
+        let mut other = identity(mouse_descriptor.clone());
+        other.interface = 0;
+        assert!(check_reader_identity(&expected, &other).is_err());
+
+        // A security key took the node: refused for what it is, even if the
+        // rest were to match.
+        let fido_descriptor = vec![
+            0x06, 0xd0, 0xf1, 0x09, 0x01, 0xa1, 0x01, 0x09, 0x20, 0x15, 0x00, 0x26, 0xff, 0x00,
+            0x75, 0x08, 0x95, 0x40, 0x81, 0x02, 0xc0,
+        ];
+        let key = identity(fido_descriptor.clone());
+        let error = check_reader_identity(&identity(fido_descriptor), &key).unwrap_err();
+        assert!(error.contains("security key"), "{error}");
+        assert!(check_reader_identity(&expected, &key).is_err());
     }
 
     #[test]
