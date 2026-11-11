@@ -1222,6 +1222,21 @@ impl BridgeService {
         self.inner.read().await.config.default_profile.clone()
     }
 
+    /// Fetches the game catalog and puts it in place of the cached one. Runs
+    /// after startup so the API never waits on the network; without the
+    /// network the cached catalog stays.
+    pub async fn refresh_game_catalog(&self) {
+        match crate::games::fetch_catalog().await {
+            Ok(games) => {
+                let mut state = self.inner.write().await;
+                config::apply_fetched_catalog(&self.config_path, &mut state.config, games);
+            }
+            Err(error) => {
+                config::log_catalog_unavailable(&error, &self.inner.read().await.config);
+            }
+        }
+    }
+
     async fn update_config(
         &self,
         update: impl FnOnce(&mut BridgeConfig) -> Result<()>,
