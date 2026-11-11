@@ -7,17 +7,10 @@ on:
 permissions:
   contents: read
 
-env:
-  # The Node.js runtime bundled into native-hid/node/ so Bridge can push
-  # DPI/polling-rate settings to non-Pulsar mice without end users needing
-  # Node.js installed separately. Bump by hand when a newer LTS ships.
-  NATIVE_HID_NODE_VERSION: v24.18.1
-  # Bump together with NATIVE_HID_NODE_VERSION: the SHA-256 of each archive
-  # below, from https://nodejs.org/dist/<version>/SHASUMS256.txt.
-  NATIVE_HID_NODE_SHA256_DARWIN_ARM64: eb02f7fab96d3d67de40c5ec8566096fcb4c2026728787683ae5a97eb612b941
-  NATIVE_HID_NODE_SHA256_DARWIN_X64: 6fb20fceacbb157c2f95825b80df4a454a0f6d81cdcd7bb81eeae9147e0e76ec
-  NATIVE_HID_NODE_SHA256_LINUX_X64: d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0
-  NATIVE_HID_NODE_SHA256_WIN_X64: ec56b84a7551893ab2324ebdfdc4ab974a63b4781162600b68a1293cc3e53765
+# The Node.js runtime bundled into native-hid/node/ (NATIVE_HID_NODE_VERSION)
+# and the SHA-256 of each archive (NATIVE_HID_NODE_SHA256_*) come from
+# .github/scripts/native-hid-node.mjs (the "Read the pinned Node.js runtime"
+# step in each build job).
 
 jobs:
   preflight:
@@ -85,12 +78,15 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: 1.99.1 # rust-toolchain.toml
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Read the pinned Node.js runtime
+        id: native-hid-node
+        run: node .github/scripts/native-hid-node.mjs
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 24
+          node-version: ${{ steps.native-hid-node.outputs.version }}
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
       - run: cargo fmt --check
@@ -210,13 +206,16 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: 1.99.1 # rust-toolchain.toml
           components: clippy, rustfmt
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Read the pinned Node.js runtime
+        id: native-hid-node
+        run: node .github/scripts/native-hid-node.mjs
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 24
+          node-version: ${{ steps.native-hid-node.outputs.version }}
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
       - run: cargo fmt --check
@@ -357,12 +356,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev appstream
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: 1.99.1 # rust-toolchain.toml
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Read the pinned Node.js runtime
+        id: native-hid-node
+        run: node .github/scripts/native-hid-node.mjs
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 24
+          node-version: ${{ steps.native-hid-node.outputs.version }}
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
       - run: cargo fmt --check

@@ -2,6 +2,7 @@
 name = "openmouse-bridge"
 version = "1.0.0"
 edition = "2024"
+rust-version = "1.99.1"
 description = "Local native HID and desktop companion for the OpenMouse control panel"
 license = "MIT"
 
@@ -38,9 +39,8 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 gpui-kit = "0.7"
 # Native handles for panel hide/restore operations on each desktop backend.
 raw-window-handle = "0.6"
-# The profile-switch overlay draws its banner on the CPU: skrifa outlines, the
-# vello_cpu rasterizer, and epaint_default_fonts for fallback glyphs.
-epaint_default_fonts = "0.36.1"
+# The profile-switch overlay draws its banner on the CPU: skrifa outlines and
+# the vello_cpu rasterizer, with DM Sans embedded (src/overlay/render.rs).
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
 vello_cpu = { version = "0.1", default-features = false, features = ["std", "u8_pipeline"] }
 

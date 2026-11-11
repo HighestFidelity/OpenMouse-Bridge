@@ -26,9 +26,12 @@ jobs:
             echo 'Set the PROTOCOL_UPDATE_TOKEN repository secret to a scoped GitHub App or personal token.' >&2
             exit 1
           fi
+      - name: Read the pinned Node.js runtime
+        id: native-hid-node
+        run: node .github/scripts/native-hid-node.mjs
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 24
+          node-version: ${{ steps.native-hid-node.outputs.version }}
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
       - name: Find newest protocol release
