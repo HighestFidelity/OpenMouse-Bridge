@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::BTreeSet, env, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 #[cfg(test)]
 use crate::config::LocalApplicationKind;
@@ -140,8 +140,13 @@ fn parse_catalog(bytes: &[u8]) -> Result<Vec<GameConfig>> {
     Ok(catalog.games)
 }
 
+/// One process scan per tick, shared by game detection, the running-process
+/// list and (on Linux) the visible applications.
 pub struct GameDetector {
     system: System,
+    /// `(pid, path, file name)` of each process in the last scan, as
+    /// `process_program` reports it, so a Wine process's cmdline is read once.
+    programs: Vec<(Pid, String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,45 +263,70 @@ impl Default for GameDetector {
     fn default() -> Self {
         Self {
             system: System::new(),
+            programs: Vec::new(),
         }
     }
 }
 
 impl GameDetector {
-    pub fn running_processes(&self) -> Vec<RunningProcess> {
-        self.system
-            .processes()
-            .values()
-            .filter_map(|process| {
-                let (path, executable) = process_program(process)?;
-                Some(RunningProcess { executable, path })
-            })
-            .collect()
-    }
-
-    pub fn detect(&mut self, games: &[GameConfig]) -> Vec<String> {
+    /// Scans the running processes. Threads are left out: with them sysinfo
+    /// reads every thread of every process, only for `process_program` to
+    /// drop them again.
+    pub fn refresh(&mut self) {
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+            ProcessRefreshKind::nothing()
+                .with_exe(UpdateKind::Always)
+                .without_tasks(),
         );
-        let running: BTreeSet<String> = self
+        self.programs = self
             .system
             .processes()
             .values()
             .filter_map(|process| {
-                process_program(process).map(|(_, executable)| executable.to_ascii_lowercase())
+                let (path, executable) = process_program(process)?;
+                Some((process.pid(), path, executable))
             })
             .collect();
-        games
+    }
+
+    /// Each process of the last scan with its program's path and file name.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn programs(&self) -> impl Iterator<Item = (&sysinfo::Process, &str, &str)> {
+        self.programs.iter().filter_map(|(pid, path, executable)| {
+            Some((
+                self.system.process(*pid)?,
+                path.as_str(),
+                executable.as_str(),
+            ))
+        })
+    }
+
+    pub fn running_processes(&self) -> Vec<RunningProcess> {
+        self.programs
             .iter()
-            .filter(|game| {
-                game.executables
-                    .iter()
-                    .any(|executable| running.contains(executable))
+            .map(|(_, path, executable)| RunningProcess {
+                executable: executable.clone(),
+                path: path.clone(),
             })
-            .map(|game| game.name.clone())
             .collect()
+    }
+
+    /// The tracked games running in the last scan.
+    pub fn matches(&self, games: &[GameConfig]) -> Vec<String> {
+        matches_running(
+            games,
+            self.programs
+                .iter()
+                .map(|(_, _, executable)| executable.as_str()),
+        )
+    }
+
+    /// Scans the processes and returns the tracked games running.
+    pub fn detect(&mut self, games: &[GameConfig]) -> Vec<String> {
+        self.refresh();
+        self.matches(games)
     }
 }
 
@@ -458,6 +488,42 @@ mod tests {
         assert_eq!(
             matches_local_games(&[target], &detector.running_processes()),
             ["local:test-process"]
+        );
+    }
+
+    /// The scan leaves threads out (the test harness runs several), and lists
+    /// each process once with the program it runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_scan_lists_processes_without_their_threads() {
+        let worker = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(500)));
+        let mut detector = GameDetector::default();
+        detector.refresh();
+        let own = sysinfo::get_current_pid().unwrap();
+        assert!(
+            detector
+                .system
+                .processes()
+                .values()
+                .all(|process| process.thread_kind().is_none())
+        );
+        let path = std::env::current_exe().unwrap();
+        let mine: Vec<_> = detector
+            .programs()
+            .filter(|(process, _, _)| process.pid() == own)
+            .map(|(_, path, executable)| (path.to_owned(), executable.to_owned()))
+            .collect();
+        worker.join().unwrap();
+        assert_eq!(
+            mine,
+            [(
+                path.to_string_lossy().into_owned(),
+                path.file_name().unwrap().to_string_lossy().into_owned()
+            )]
+        );
+        assert_eq!(
+            detector.running_processes().len(),
+            detector.programs().count()
         );
     }
 

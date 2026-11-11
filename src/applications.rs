@@ -53,6 +53,7 @@ mod imp {
     };
 
     use super::{ApplicationInfo, icon_id};
+    use crate::games::GameDetector;
 
     const ICON_SIZE: u32 = 48;
 
@@ -61,7 +62,8 @@ mod imp {
         applications: BTreeMap<String, ApplicationInfo>,
     }
 
-    pub fn visible_applications() -> Vec<ApplicationInfo> {
+    /// Windows lists applications by their visible windows, not processes.
+    pub fn visible_applications(_processes: &GameDetector) -> Vec<ApplicationInfo> {
         let mut collection = WindowCollection {
             foreground: unsafe { GetForegroundWindow() },
             applications: BTreeMap::new(),
@@ -242,8 +244,9 @@ mod imp {
     use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 
     use super::{ApplicationInfo, icon_id};
+    use crate::games::GameDetector;
 
-    pub fn visible_applications() -> Vec<ApplicationInfo> {
+    pub fn visible_applications(_processes: &GameDetector) -> Vec<ApplicationInfo> {
         let workspace = NSWorkspace::sharedWorkspace();
         let mut applications = BTreeMap::new();
         for application in workspace.runningApplications().iter() {
@@ -291,33 +294,30 @@ mod imp {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    use std::sync::Mutex;
+
+    use sysinfo::Pid;
     use x11rb::connection::Connection;
+    use x11rb::errors::{ConnectionError, ReplyError};
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+    use x11rb::rust_connection::RustConnection;
 
     use super::{ApplicationInfo, icon_id};
+    use crate::games::GameDetector;
 
-    /// Lists one entry per running process: `sysinfo` sees every process, but
-    /// X11 only knows mapped windows, and matching the two for every process
-    /// each poll costs a round trip per PID. Like macOS, only the foreground
-    /// entry is matched to a window; on Wayland (no X connection) every
-    /// entry reports `foreground: false`, so game-profile fallback still
-    /// works but focus matching does not.
-    pub fn visible_applications() -> Vec<ApplicationInfo> {
+    /// Lists one entry per running process of the detector's last scan:
+    /// `sysinfo` sees every process, but X11 only knows mapped windows, and
+    /// matching the two for every process each poll costs a round trip per
+    /// PID. Like macOS, only the foreground entry is matched to a window; on
+    /// Wayland (no X connection) every entry reports `foreground: false`, so
+    /// game-profile fallback still works but focus matching does not.
+    pub fn visible_applications(processes: &GameDetector) -> Vec<ApplicationInfo> {
         let foreground_pid = active_window_pid();
-        let mut system = System::new();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
-        );
         let mut applications = BTreeMap::new();
-        for process in system.processes().values() {
-            // A Proton game reports the Windows program Wine runs, not the
-            // Wine loader every game shares.
-            let Some((path, executable)) = crate::games::process_program(process) else {
-                continue;
-            };
+        // A Proton game reports the Windows program Wine runs, not the Wine
+        // loader every game shares (`process_program`).
+        for (process, path, executable) in processes.programs() {
+            let (path, executable) = (path.to_owned(), executable.to_owned());
             if executable.is_empty() {
                 continue;
             }
@@ -384,29 +384,76 @@ mod imp {
         if let Some(pid) = crate::kwin_focus::focused_pid() {
             return pid;
         }
-        let (conn, screen) = x11rb::connect(None).ok()?;
-        let root = conn.setup().roots[screen].root;
-        let active_window = intern(&conn, b"_NET_ACTIVE_WINDOW")?;
-        let pid_atom = intern(&conn, b"_NET_WM_PID")?;
-        let reply = conn
-            .get_property(false, root, active_window, AtomEnum::WINDOW, 0, 1)
-            .ok()?
-            .reply()
-            .ok()?;
-        let window = reply.value32()?.next()?;
-        if window == 0 {
-            return None;
+        static X11: Mutex<Option<X11Focus>> = Mutex::new(None);
+        let mut x11 = X11.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A connection that broke (the X server restarted) is replaced once
+        // in the same call, so the answer is the same as with a fresh one.
+        for _ in 0..2 {
+            if x11.is_none() {
+                *x11 = X11Focus::connect();
+            }
+            match x11.as_ref()?.focused_pid() {
+                Ok(pid) => return pid,
+                Err(_) => *x11 = None,
+            }
         }
-        let reply = conn
-            .get_property(false, window, pid_atom, AtomEnum::CARDINAL, 0, 1)
-            .ok()?
-            .reply()
-            .ok()?;
-        let pid = reply.value32()?.next()?;
-        (pid != 0).then_some(pid)
+        None
     }
 
-    fn intern(conn: &x11rb::rust_connection::RustConnection, name: &[u8]) -> Option<u32> {
+    /// One X connection kept across polls, with the two atoms it needs.
+    struct X11Focus {
+        conn: RustConnection,
+        root: u32,
+        active_window: u32,
+        pid_atom: u32,
+    }
+
+    impl X11Focus {
+        fn connect() -> Option<Self> {
+            let (conn, screen) = x11rb::connect(None).ok()?;
+            let root = conn.setup().roots[screen].root;
+            let active_window = intern(&conn, b"_NET_ACTIVE_WINDOW")?;
+            let pid_atom = intern(&conn, b"_NET_WM_PID")?;
+            Some(Self {
+                conn,
+                root,
+                active_window,
+                pid_atom,
+            })
+        }
+
+        /// `Err` only when the connection itself failed.
+        fn focused_pid(&self) -> Result<Option<u32>, ConnectionError> {
+            let window = self.property(self.root, self.active_window, AtomEnum::WINDOW)?;
+            let Some(window) = window.filter(|window| *window != 0) else {
+                return Ok(None);
+            };
+            let pid = self.property(window, self.pid_atom, AtomEnum::CARDINAL)?;
+            Ok(pid.filter(|pid| *pid != 0))
+        }
+
+        /// The first 32-bit value of `property` on `window`; `None` when it is
+        /// unset or the server refused the request (a window that just
+        /// closed).
+        fn property(
+            &self,
+            window: u32,
+            property: u32,
+            kind: AtomEnum,
+        ) -> Result<Option<u32>, ConnectionError> {
+            match self
+                .conn
+                .get_property(false, window, property, kind, 0, 1)?
+                .reply()
+            {
+                Ok(reply) => Ok(reply.value32().and_then(|mut values| values.next())),
+                Err(ReplyError::ConnectionError(error)) => Err(error),
+                Err(ReplyError::X11Error(_)) => Ok(None),
+            }
+        }
+    }
+
+    fn intern(conn: &RustConnection, name: &[u8]) -> Option<u32> {
         conn.intern_atom(false, name)
             .ok()?
             .reply()
@@ -419,7 +466,7 @@ mod imp {
 mod imp {
     use super::ApplicationInfo;
 
-    pub fn visible_applications() -> Vec<ApplicationInfo> {
+    pub fn visible_applications(_processes: &crate::games::GameDetector) -> Vec<ApplicationInfo> {
         Vec::new()
     }
 

@@ -313,8 +313,10 @@ pub(crate) fn reconcile_automatic(
 /// (`"<brand>:<name>"`) over native HID — battery, and the current DPI /
 /// polling rate / switch mode wherever the driver can read them.
 /// `Ok(None)` means Bridge has no reader for the brand or the mouse reports
-/// no battery; `Err` means a driver exists but the mouse did not answer
-/// (e.g. asleep or disconnected).
+/// no battery; a [`NoDriver`] error means no reader exists for the brand at
+/// all, so asking again cannot help until Bridge is updated; any other `Err`
+/// means a driver exists but the mouse did not answer (e.g. asleep or
+/// disconnected).
 pub fn read_status(device_id: &str) -> Result<Option<NativeStatus>> {
     let brand = device_id.split(':').next().unwrap_or_default();
     let _access = device_access();
@@ -325,13 +327,35 @@ pub fn read_status(device_id: &str) -> Result<Option<NativeStatus>> {
     // The Attack Shark R5 Ultra is labelled "Delux" by its vendor id. The node
     // helper cannot read it, so it is read natively; a mouse that is not
     // plugged in falls through to the helper like any other Delux device.
-    if lamzu::handles(brand)
-        && let Some(status) = lamzu::read_status()?
-    {
-        return Ok(Some(status));
+    if lamzu::handles(brand) {
+        if let Some(status) = lamzu::read_status()? {
+            return Ok(Some(status));
+        }
+        // An R5 Ultra plugged in later is read natively, so the helper having
+        // no driver says nothing lasting about these brands.
+        return native_hid::read_status(brand).or_else(|error| {
+            if error.is::<NoDriver>() {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        });
     }
     native_hid::read_status(brand)
 }
+
+/// The native-hid helper has no driver for a brand. Its drivers are fixed
+/// for the helper this Bridge ships, so the answer holds until an update.
+#[derive(Debug)]
+pub struct NoDriver;
+
+impl std::fmt::Display for NoDriver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("no native driver for this brand")
+    }
+}
+
+impl std::error::Error for NoDriver {}
 
 /// local Bridge. Native-only devices use this path when WebHID cannot access
 /// their protected configuration interface.
@@ -512,6 +536,18 @@ mod tests {
                 );
             }
             assert!(values.lock().unwrap().calls.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_brand_the_helper_has_no_driver_for_reads_as_no_driver() {
+        let _serial = TEST_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+        native_hid::with_test_helper(Box::new(|_| Ok(None)), || {
+            assert!(read_status("Nobrand:Mouse").unwrap_err().is::<NoDriver>());
+        });
+        // A helper that answered without a battery is not "no driver".
+        native_hid::with_test_helper(Box::new(|_| Ok(Some(b"{}".to_vec()))), || {
+            assert!(read_status("Nobrand:Mouse").unwrap().is_none());
         });
     }
 

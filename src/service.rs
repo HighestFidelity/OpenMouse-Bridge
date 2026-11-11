@@ -331,6 +331,14 @@ fn image_type(bytes: &[u8]) -> Option<&'static str> {
     crate::remote_image::image_type(bytes).filter(|kind| *kind != "image/gif")
 }
 
+/// Writes config.json (with an fsync) on a blocking thread, off the async
+/// workers and outside the state lock.
+async fn write_config(path: Arc<PathBuf>, config: BridgeConfig) -> Result<()> {
+    tokio::task::spawn_blocking(move || config::save(&path, &config))
+        .await
+        .context("the config save stopped unexpectedly")?
+}
+
 fn game_image_dir(config_path: &Path) -> PathBuf {
     config_path
         .parent()
@@ -489,12 +497,40 @@ type PanelListener = Arc<dyn Fn() + Send + Sync>;
 pub struct BridgeService {
     inner: Arc<RwLock<BridgeState>>,
     config_path: Arc<PathBuf>,
+    // Held from reading the config to committing a change and its save, so
+    // config changes apply one at a time without the state lock.
+    config_saves: Arc<tokio::sync::Mutex<()>>,
     notice_listener: Arc<std::sync::Mutex<Option<NoticeListener>>>,
     show_panel: Arc<std::sync::Mutex<Option<PanelListener>>>,
     buttons: Arc<crate::buttons::ButtonListener>,
     native_automation: Arc<std::sync::Mutex<crate::drivers::automation::NativeAutomation>>,
     // Set while a battery poll runs, so two never overlap.
     battery_polling: Arc<AtomicBool>,
+    // Brands the native-hid helper has no driver for, skipped by the
+    // battery poll for a while instead of starting the helper every time.
+    no_driver: Arc<std::sync::Mutex<NoDriverBrands>>,
+}
+
+/// How long the battery poll skips a brand the helper had no driver for.
+const NO_DRIVER_RETRY: Duration = Duration::from_secs(60 * 60);
+
+/// Brands whose native read last said "no driver", and when.
+#[derive(Default)]
+struct NoDriverBrands(HashMap<String, Instant>);
+
+impl NoDriverBrands {
+    fn remember(&mut self, device_id: &str, now: Instant) {
+        self.0.insert(brand_of(device_id).to_ascii_lowercase(), now);
+    }
+
+    /// Whether to skip reading `device_id`, its brand having had no driver
+    /// within `NO_DRIVER_RETRY`.
+    fn skips(&mut self, device_id: &str, now: Instant) -> bool {
+        self.0
+            .retain(|_, since| now.saturating_duration_since(*since) < NO_DRIVER_RETRY);
+        self.0
+            .contains_key(&brand_of(device_id).to_ascii_lowercase())
+    }
 }
 
 /// Whether Home should offer this version's notes: Bridge has run before
@@ -533,6 +569,9 @@ struct BridgeState {
     // Remembered mice whose receiver is plugged in but whose last native read
     // went unanswered: asleep, switched off or out of range.
     asleep: HashSet<String>,
+    // `hid_access::blocked_devices()` as of the last device scan (every
+    // `DEVICE_SCAN_INTERVAL`), so a snapshot does not walk sysfs.
+    blocked_hid_devices: Vec<String>,
     // Debounced active-profile tracking for switch notifications.
     active_profile_key: Option<String>,
     applied_profile: Option<ApplicationProfile>,
@@ -639,7 +678,7 @@ fn estimate_minutes_remaining(
     (minutes > 0 && minutes <= BATTERY_MAX_ESTIMATE_MINUTES).then_some(minutes)
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceBattery {
     pub device_id: String,
@@ -666,7 +705,7 @@ pub struct DeviceBattery {
 /// device that ever reported a charge level — this reflects the live HID
 /// session, so the status view can follow device switches (including wired
 /// mice that never report battery).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveDevice {
     pub key: String,
@@ -675,14 +714,14 @@ pub struct ActiveDevice {
     pub product_id: u16,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GameActivity {
     pub name: String,
     pub active: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeSnapshot {
     pub version: &'static str,
@@ -725,7 +764,7 @@ pub struct BridgeSnapshot {
 }
 
 /// A remembered mouse as the status view shows it.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KnownDeviceStatus {
     pub id: String,
@@ -836,6 +875,7 @@ impl BridgeService {
                 known,
                 detected: None,
                 asleep: HashSet::new(),
+                blocked_hid_devices: crate::hid_access::blocked_devices(),
                 active_profile_key: None,
                 applied_profile: None,
                 native_automation_error: None,
@@ -847,12 +887,20 @@ impl BridgeService {
                 device_mode: DeviceMode::Onboard,
             })),
             config_path: Arc::new(config_path),
+            config_saves: Arc::default(),
             notice_listener: Arc::default(),
             show_panel: Arc::default(),
             buttons: Arc::default(),
             native_automation: Arc::default(),
             battery_polling: Arc::default(),
+            no_driver: Arc::default(),
         }
+    }
+
+    fn no_driver_brands(&self) -> std::sync::MutexGuard<'_, NoDriverBrands> {
+        self.no_driver
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Opens the tray panel. A second Bridge launch calls this over localhost
@@ -1087,7 +1135,7 @@ impl BridgeService {
             active_devices,
             batteries,
             known_devices,
-            blocked_hid_devices: crate::hid_access::blocked_devices(),
+            blocked_hid_devices: state.blocked_hid_devices.clone(),
             whats_new: whats_new_pending(&state.config),
         }
     }
@@ -1241,8 +1289,10 @@ impl BridgeService {
         &self,
         update: impl FnOnce(&mut BridgeConfig) -> Result<()>,
     ) -> Result<()> {
-        let mut state = self.inner.write().await;
-        let mut next = state.config.clone();
+        // Held until `next` is committed, so no other config change lands in
+        // between and the saves reach the disk in commit order.
+        let saving = Arc::clone(&self.config_saves).lock_owned().await;
+        let mut next = self.inner.read().await.config.clone();
         update(&mut next)?;
         next = next.normalized();
         for profile in next
@@ -1252,9 +1302,37 @@ impl BridgeService {
         {
             crate::local_targets::canonicalize_profile(profile, &next.local_applications)?;
         }
-        config::save(&self.config_path, &next)?;
-        state.config = next;
-        Ok(())
+        // Saved and committed in a task of its own: a caller that goes away
+        // mid-save (an HTTP client hanging up) cannot leave config.json
+        // written but the change missing from memory.
+        let inner = Arc::clone(&self.inner);
+        let path = Arc::clone(&self.config_path);
+        tokio::spawn(async move {
+            let _saving = saving;
+            write_config(path, next.clone()).await?;
+            inner.write().await.config = next;
+            Ok(())
+        })
+        .await
+        .context("the config update stopped unexpectedly")?
+    }
+
+    /// Changes the config in memory right away, then saves it, like before
+    /// `update_config` existed: for settings the tray applies on the spot.
+    async fn set_config_then_save(&self, change: impl FnOnce(&mut BridgeConfig)) -> Result<()> {
+        let saving = Arc::clone(&self.config_saves).lock_owned().await;
+        let config = {
+            let mut state = self.inner.write().await;
+            change(&mut state.config);
+            state.config.clone()
+        };
+        let path = Arc::clone(&self.config_path);
+        tokio::spawn(async move {
+            let _saving = saving;
+            write_config(path, config).await
+        })
+        .await
+        .context("the config save stopped unexpectedly")?
     }
 
     pub async fn replace_local_applications(
@@ -1351,22 +1429,16 @@ impl BridgeService {
     }
 
     pub async fn set_tray_battery_style(&self, style: &str) -> Result<()> {
-        let config = {
-            let mut state = self.inner.write().await;
-            state.config.tray_battery_style = style.to_owned();
-            state.config = state.config.clone().normalized();
-            state.config.clone()
-        };
-        config::save(&self.config_path, &config)
+        self.set_config_then_save(|config| {
+            config.tray_battery_style = style.to_owned();
+            *config = config.clone().normalized();
+        })
+        .await
     }
 
     pub async fn set_hybrid_mode(&self, enabled: bool) -> Result<()> {
-        let config = {
-            let mut state = self.inner.write().await;
-            state.config.hybrid_mode = enabled;
-            state.config.clone()
-        };
-        config::save(&self.config_path, &config)
+        self.set_config_then_save(|config| config.hybrid_mode = enabled)
+            .await
     }
 
     pub async fn set_automatic_updates(&self, enabled: bool) -> Result<()> {
@@ -1581,9 +1653,14 @@ impl BridgeService {
             let mut last_recheck = Instant::now();
             loop {
                 interval.tick().await;
-                let detected = tokio::task::spawn_blocking(drivers::detect_mice)
-                    .await
-                    .unwrap_or_default();
+                let (detected, blocked) = match tokio::task::spawn_blocking(|| {
+                    (drivers::detect_mice(), crate::hid_access::blocked_devices())
+                })
+                .await
+                {
+                    Ok((detected, blocked)) => (detected, Some(blocked)),
+                    Err(_) => (Vec::new(), None),
+                };
                 let ids: HashSet<String> = detected
                     .iter()
                     .map(|mouse| mouse.device_id.clone())
@@ -1593,6 +1670,9 @@ impl BridgeService {
                     .is_some_and(|before| ids.iter().any(|id| !before.contains(id)));
                 let recheck = {
                     let mut state = service.inner.write().await;
+                    if let Some(blocked) = blocked {
+                        state.blocked_hid_devices = blocked;
+                    }
                     remember_detected(&mut state.known, &detected);
                     // A mouse whose receiver left is disconnected, not asleep.
                     let BridgeState { known, asleep, .. } = &mut *state;
@@ -1746,13 +1826,32 @@ impl BridgeService {
                         state.config.local_applications.clone(),
                     )
                 };
-                let mut active = detector.detect(&games);
-                let processes = detector.running_processes();
-                active.extend(crate::games::matches_local_games(
-                    &local_applications,
-                    &processes,
-                ));
-                let running = applications::visible_applications();
+                // One process scan per tick, off the async workers: it reads
+                // /proc (or lists windows) for every process.
+                let mut scanner = std::mem::take(&mut detector);
+                let scan_input = (games.clone(), local_applications.clone());
+                let (scanner, active, processes, running) =
+                    match tokio::task::spawn_blocking(move || {
+                        let (games, local_applications) = scan_input;
+                        scanner.refresh();
+                        let mut active = scanner.matches(&games);
+                        let processes = scanner.running_processes();
+                        active.extend(crate::games::matches_local_games(
+                            &local_applications,
+                            &processes,
+                        ));
+                        let running = applications::visible_applications(&scanner);
+                        (scanner, active, processes, running)
+                    })
+                    .await
+                    {
+                        Ok(scan) => scan,
+                        Err(error) if error.is_panic() => {
+                            std::panic::resume_unwind(error.into_panic())
+                        }
+                        Err(_) => return,
+                    };
+                detector = scanner;
                 let applications = profile_applications(&running, &games, &local_applications);
                 // Icon extraction can be disabled by callers that never serve
                 // the application's icon endpoint.
@@ -1769,10 +1868,26 @@ impl BridgeService {
                             })
                             .collect::<Vec<_>>()
                     };
-                    missing_icons
-                        .into_iter()
-                        .map(|(icon_id, path)| (icon_id, applications::application_icon(&path)))
-                        .collect::<Vec<_>>()
+                    if missing_icons.is_empty() {
+                        Vec::new()
+                    } else {
+                        match tokio::task::spawn_blocking(move || {
+                            missing_icons
+                                .into_iter()
+                                .map(|(icon_id, path)| {
+                                    (icon_id, applications::application_icon(&path))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .await
+                        {
+                            Ok(icons) => icons,
+                            Err(error) if error.is_panic() => {
+                                std::panic::resume_unwind(error.into_panic())
+                            }
+                            Err(_) => return,
+                        }
+                    }
                 } else {
                     Vec::new()
                 };
@@ -2012,6 +2127,10 @@ async fn poll_batteries_once(service: BridgeService) {
         return;
     }
     for (device_id, device_name) in devices {
+        if service.no_driver_brands().skips(&device_id, Instant::now()) {
+            tracing::debug!(%device_id, "No native battery reader for this device");
+            continue;
+        }
         let id = device_id.clone();
         let outcome = tokio::task::spawn_blocking(move || crate::drivers::read_status(&id)).await;
         match outcome {
@@ -2055,6 +2174,12 @@ async fn poll_batteries_once(service: BridgeService) {
             Ok(Ok(None)) => {
                 tracing::debug!(%device_id, "No native battery reader for this device");
             }
+            Ok(Err(error)) if error.is::<drivers::NoDriver>() => {
+                tracing::debug!(%device_id, "No native battery reader for this device");
+                service
+                    .no_driver_brands()
+                    .remember(&device_id, Instant::now());
+            }
             Ok(Err(error)) => {
                 tracing::debug!(%error, %device_id, "Could not read the mouse battery");
                 // A control panel took the mouse over mid-poll: the read was
@@ -2092,14 +2217,18 @@ fn read_through(device_id: &str, discovered: &[drivers::DetectedMouse]) -> Optio
 /// alone, since that failure more likely means no reader supports it. So is
 /// everything while hidraw nodes are blocked, when no read can get through.
 async fn mark_unanswered(service: &BridgeService, device_id: &str, through: Option<&str>) {
-    let blocked = !tokio::task::spawn_blocking(crate::hid_access::blocked_devices)
+    let blocked = tokio::task::spawn_blocking(crate::hid_access::blocked_devices)
         .await
-        .unwrap_or_default()
-        .is_empty();
-    if blocked {
-        return;
-    }
+        .ok();
     let mut state = service.inner.write().await;
+    if let Some(blocked) = blocked {
+        // Fresher than the last device scan, so the snapshot gets it too.
+        let any_blocked = !blocked.is_empty();
+        state.blocked_hid_devices = blocked;
+        if any_blocked {
+            return;
+        }
+    }
     let unanswered = unanswered_mice(state.known.devices(), device_id, through);
     state.asleep.extend(unanswered);
 }
@@ -3184,6 +3313,77 @@ mod tests {
         assert!(!known[0].connected);
         assert!(known[0].last_seen_seconds_ago >= 3 * 60 * 60);
         assert_eq!(known[0].percent, Some(40));
+    }
+
+    #[test]
+    fn a_brand_without_a_driver_is_skipped_for_an_hour() {
+        let mut brands = NoDriverBrands::default();
+        let start = Instant::now();
+        assert!(!brands.skips("Corsair:M65", start));
+        brands.remember("Corsair:M65", start);
+        assert!(brands.skips("corsair:046d:c547", start), "the whole brand");
+        assert!(!brands.skips("Razer:Viper", start));
+        assert!(brands.skips(
+            "Corsair:M65",
+            start + NO_DRIVER_RETRY - Duration::from_secs(1)
+        ));
+        assert!(!brands.skips("Corsair:M65", start + NO_DRIVER_RETRY));
+        assert!(brands.0.is_empty(), "expired brands are dropped");
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_reports_blocked_nodes_from_the_last_scan() {
+        let bridge = service(BridgeConfig::default());
+        bridge.inner.write().await.blocked_hid_devices = vec!["/dev/hidraw3".into()];
+        assert_eq!(
+            bridge.snapshot().await.blocked_hid_devices,
+            ["/dev/hidraw3"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_config_changes_are_saved_in_the_order_they_apply() {
+        let path = temp_config_path();
+        let bridge = BridgeService::new(BridgeConfig::default(), path.clone());
+        let changes: Vec<_> = (0..24_u8)
+            .map(|step| {
+                let bridge = bridge.clone();
+                tokio::spawn(async move {
+                    if step % 3 == 0 {
+                        bridge.set_hybrid_mode(step % 2 == 0).await
+                    } else {
+                        bridge.set_battery_threshold(step).await
+                    }
+                })
+            })
+            .collect();
+        for change in changes {
+            change.await.unwrap().unwrap();
+        }
+        let saved: BridgeConfig = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let memory = bridge.config().await;
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&memory).unwrap(),
+            "config.json holds the last change applied in memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_config_save_is_reported_and_not_applied() {
+        // The config's folder is a file, so the save cannot create it.
+        let blocker = temp_config_path().with_file_name("not-a-folder");
+        std::fs::write(&blocker, b"").unwrap();
+        let bridge = BridgeService::new(BridgeConfig::default(), blocker.join("config.json"));
+        let before = bridge.config().await.battery_threshold_percent;
+        assert!(bridge.set_battery_threshold(before + 1).await.is_err());
+        assert_eq!(bridge.config().await.battery_threshold_percent, before);
+        // The tray's own toggles still apply in memory first, as before.
+        assert!(bridge.config().await.hybrid_mode);
+        assert!(bridge.set_hybrid_mode(false).await.is_err());
+        assert!(!bridge.config().await.hybrid_mode);
+        // A later change still goes through the same path.
+        assert!(bridge.set_automatic_updates(false).await.is_err());
     }
 
     #[tokio::test]

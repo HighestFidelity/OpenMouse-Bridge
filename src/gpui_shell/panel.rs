@@ -383,11 +383,26 @@ impl PanelView {
         crate::tray_battery::from_snapshot(self.snapshot.as_ref())
     }
 
+    /// The settings the panel shows from its own state, which each snapshot
+    /// overwrites.
+    fn shown_settings(&self) -> (bool, bool, bool, TrayBatteryStyle, u8, bool, u8) {
+        (
+            self.autostart,
+            self.automatic_updates,
+            self.hybrid_mode,
+            self.tray_style,
+            self.battery_threshold,
+            self.notification_sound,
+            self.notification_volume,
+        )
+    }
+
     /// Takes everything the core has queued since the last poll. Notices become
     /// system notifications for now; the GPUI overlay replaces that later.
     pub fn drain(&mut self) -> Drained {
         let mut changed = false;
-        while let Ok(snapshot) = self.snapshots.try_recv() {
+        while let Ok(mut snapshot) = self.snapshots.try_recv() {
+            let settings = self.shown_settings();
             self.autostart = snapshot.autostart_enabled;
             self.automatic_updates = snapshot.automatic_updates;
             self.hybrid_mode = snapshot.hybrid_mode;
@@ -395,8 +410,14 @@ impl PanelView {
             self.battery_threshold = snapshot.battery_threshold_percent;
             self.notification_sound = snapshot.notification_sound;
             self.notification_volume = snapshot.notification_volume;
+            // A snapshot arrives every second; repaint only when it, or a
+            // setting it overrides, would show differently.
+            changed |= settings != self.shown_settings()
+                || self
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|shown| !shows_the_same(shown, &mut snapshot));
             self.snapshot = Some(snapshot);
-            changed = true;
         }
         if let UdevFix::Running(result) = &self.udev_fix
             && let Ok(result) = result.try_recv()
@@ -785,6 +806,40 @@ fn format_age(seconds: u64) -> String {
         3_600..=86_399 => format!("{} h ago", seconds / 3_600),
         _ => format!("{} d ago", seconds / 86_400),
     }
+}
+
+/// Whether `next` would show the same as `shown`. The uptime and "last seen"
+/// clocks tick every second, but the panel shows them to the minute or
+/// coarser, so they count as the same while their text is.
+fn shows_the_same(shown: &BridgeSnapshot, next: &mut BridgeSnapshot) -> bool {
+    if format_uptime(shown.uptime_seconds) != format_uptime(next.uptime_seconds)
+        || shown.known_devices.len() != next.known_devices.len()
+        || shown
+            .known_devices
+            .iter()
+            .zip(&next.known_devices)
+            .any(|(shown, next)| {
+                format_age(shown.last_seen_seconds_ago) != format_age(next.last_seen_seconds_ago)
+            })
+    {
+        return false;
+    }
+    // Compare the rest with the clocks set equal, then put them back.
+    let uptime = std::mem::replace(&mut next.uptime_seconds, shown.uptime_seconds);
+    let ages: Vec<u64> = next
+        .known_devices
+        .iter_mut()
+        .zip(&shown.known_devices)
+        .map(|(next, shown)| {
+            std::mem::replace(&mut next.last_seen_seconds_ago, shown.last_seen_seconds_ago)
+        })
+        .collect();
+    let same = shown == next;
+    next.uptime_seconds = uptime;
+    for (device, age) in next.known_devices.iter_mut().zip(ages) {
+        device.last_seen_seconds_ago = age;
+    }
+    same
 }
 
 fn format_uptime(seconds: u64) -> String {
@@ -1622,8 +1677,49 @@ impl Render for PanelView {
 mod tests {
     // Not `use super::*`: that pulls in GPUI's own `test` macro, which shadows
     // `#[test]`.
-    use super::{UpdateState, offered_notes, step_threshold, step_volume};
+    use super::{UpdateState, offered_notes, shows_the_same, step_threshold, step_volume};
     use crate::runtime::UpdateEvent;
+    use openmouse_bridge::service::{KnownDeviceState, KnownDeviceStatus};
+
+    #[test]
+    fn a_snapshot_that_shows_the_same_does_not_repaint() {
+        let device = |seconds_ago| KnownDeviceStatus {
+            id: "Razer:x".into(),
+            name: "Razer X".into(),
+            connected: false,
+            state: KnownDeviceState::Disconnected,
+            last_seen_seconds_ago: seconds_ago,
+            percent: Some(40),
+            charging: None,
+            dpi: None,
+            polling_rate_hz: None,
+            switch_mode: None,
+        };
+        let mut shown = crate::gpui_shell::test_snapshot();
+        shown.uptime_seconds = 61;
+        shown.known_devices = vec![device(120)];
+        let mut next = crate::gpui_shell::test_snapshot();
+        next.uptime_seconds = 62;
+        next.known_devices = vec![device(121)];
+        assert!(shows_the_same(&shown, &mut next), "same minute, same text");
+        assert_eq!(next.uptime_seconds, 62, "the clocks are put back");
+        assert_eq!(next.known_devices[0].last_seen_seconds_ago, 121);
+
+        next.uptime_seconds = 120;
+        assert!(!shows_the_same(&shown, &mut next), "the minute turned");
+        next.uptime_seconds = 62;
+        next.known_devices[0].last_seen_seconds_ago = 180;
+        assert!(!shows_the_same(&shown, &mut next), "3 min ago, not 2");
+        next.known_devices[0].last_seen_seconds_ago = 121;
+        next.known_devices[0].percent = Some(39);
+        assert!(!shows_the_same(&shown, &mut next), "the reading changed");
+        next.known_devices[0].percent = Some(40);
+        next.hybrid_mode = false;
+        assert!(!shows_the_same(&shown, &mut next));
+        next.hybrid_mode = true;
+        next.known_devices.clear();
+        assert!(!shows_the_same(&shown, &mut next));
+    }
 
     #[test]
     fn the_alert_level_steps_along_the_offered_list() {
