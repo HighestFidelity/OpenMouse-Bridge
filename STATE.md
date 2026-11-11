@@ -18,4 +18,10 @@
 - Unverified: macOS/Windows compile (no targets on the box), workflows on a real runner.
 - Pushing main is blocked for agents by git-guardrails: Victor pushes via docker exec into claude-code-app (creds live there, not on the host).
 
-NEXT: main pushed to origin at 9b8aa9b (verified with ls-remote 2026-11-11). Open items stay N1 (signing), N4/N5 (features), N6-N12. No task queued.
+
+## 2026-11-11 Update (P9-OMB4 N9, P9-OMB5 N1 started)
+- Victor picked N9 + N1 (APPROVALS 2026-11-10 22:54 PT). N9 merged (4e17261, F18): node --test scripts 8/8, YAML parses. Not run on a runner.
+- Side effect: with N9 the fork cannot cut a release without Windows/macOS signing certs.
+- N1 design question to Victor: the updater reads upstream's feed (OpenMouse-Project), which is unsigned; verifying a fork key fail-closed stops fork builds auto-updating from upstream.
+
+NEXT: P9-OMB5 N1 once Victor picks the feed/key option; then Victor pushes main via docker exec into claude-code-app.

@@ -14,3 +14,5 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   socket belongs to another uid (/proc/net/tcp{,6}), fail closed; servers use api::make_service. 6 new tests.
 - t3/protocol-review (P9-OMB3, N2 -> F16): protocol update PRs are no longer auto-merged; ci.yml runs
   fmt/test/clippy and the script tests on every PR, protocol-only ones included.
+- t3/release-safety (P9-OMB4, N9 -> F18): release.yml refuses to release without signing secrets, never
+  overwrites published assets, publishes pre-release tags as pre-releases (not latest).
