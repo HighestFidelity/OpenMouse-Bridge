@@ -17,11 +17,16 @@ use tokio::sync::{mpsc, watch};
 const MAX_REPORT_BYTES: usize = MAX_REPORT_DESCRIPTOR_SIZE;
 const INPUT_QUEUE_CAPACITY: usize = 64;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long an owned-handle reader blocks waiting for input before it checks
+/// its stop flag again. It bounds how long closing, unlistening or ending a
+/// session waits for the reader threads to join.
 #[cfg(target_os = "windows")]
 const READ_TIMEOUT_MS: i32 = 100;
+#[cfg(target_os = "linux")]
+const READ_TIMEOUT_MS: i32 = 50;
 /// How long a shared-handle reader waits between empty polls. The wait happens
 /// with the device lock released, so a write never queues behind a read.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 const SHARED_READ_IDLE: std::time::Duration = std::time::Duration::from_millis(2);
 const MICROSOFT_VENDOR_ID: u16 = 0x045E;
 const RAZER_VENDOR_ID: u16 = 0x1532;
@@ -354,23 +359,31 @@ struct Candidate {
 }
 
 struct OpenPath {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     path: CString,
     device: Arc<Mutex<HidDevice>>,
     layout: ReportLayout,
 }
 
+/// The handle an input reader thread reads from.
+///
+/// Windows and Linux give the reader its own handle: each Windows handle and
+/// each open hidraw fd on Linux gets its own copy of every input report, so
+/// the reader can block in `read_timeout` without holding up writes on the
+/// command handle, and without spinning. macOS (and the libusb backends)
+/// keep polling the shared command handle: whether a second IOHIDDevice open
+/// of the same interface also receives every input report is unverified.
 enum ReaderHandle {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     Owned(HidDevice),
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     Shared(Arc<Mutex<HidDevice>>),
 }
 
 impl ReaderHandle {
     fn read(&self, buffer: &mut [u8]) -> Result<usize, String> {
         match self {
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             Self::Owned(device) => device
                 .read_timeout(buffer, READ_TIMEOUT_MS)
                 .map_err(|error| error.to_string()),
@@ -380,7 +393,7 @@ impl ReaderHandle {
             // seconds — and the writer holds the session lock meanwhile, so
             // every other command (even `list`) stalls behind it. Read without
             // blocking under the lock and idle with it released instead.
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             Self::Shared(device) => {
                 let size = device
                     .lock()
@@ -391,6 +404,55 @@ impl ReaderHandle {
                     thread::sleep(SHARED_READ_IDLE);
                 }
                 Ok(size)
+            }
+        }
+    }
+}
+
+/// One input reader thread's loop: forwards each report `read` returns until
+/// the stop flag is set, the session's input queue rejects a report, or the
+/// read fails. `read` returns 0 when nothing arrived within its timeout, so
+/// the stop flag is seen within one read timeout.
+fn run_reader(
+    mut read: impl FnMut(&mut [u8]) -> Result<usize, String>,
+    stop: &AtomicBool,
+    tx: &InputSender,
+    device_key: &str,
+    interface: usize,
+    buffer_len: usize,
+    uses_report_ids: bool,
+) {
+    let mut buffer = vec![0; buffer_len];
+    while !stop.load(Ordering::Acquire) {
+        match read(&mut buffer) {
+            Ok(0) => {}
+            Ok(size) => {
+                let (report_id, data) = if uses_report_ids {
+                    (buffer[0], buffer[1..size].to_vec())
+                } else {
+                    (0, buffer[..size].to_vec())
+                };
+                if tx
+                    .send(InputReport {
+                        kind: "inputreport",
+                        device: device_key.to_owned(),
+                        report_id,
+                        data,
+                    })
+                    .is_err()
+                {
+                    stop.store(true, Ordering::Release);
+                    break;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    device = %device_key,
+                    interface,
+                    %error,
+                    "Native HID input reader stopped"
+                );
+                break;
             }
         }
     }
@@ -439,6 +501,18 @@ struct HidSession {
     open_devices: HashMap<String, OpenDevice>,
     listeners: HashSet<String>,
     input_tx: InputSender,
+}
+
+impl Drop for HidSession {
+    /// Asks every reader to stop before any is joined, so ending a session
+    /// waits about one read timeout in total rather than one per device.
+    fn drop(&mut self) {
+        for open in self.open_devices.values() {
+            if let Some(stop) = &open.stop {
+                stop.store(true, Ordering::Release);
+            }
+        }
+    }
 }
 
 impl HidSession {
@@ -692,7 +766,7 @@ impl HidSession {
         for candidate_path in &candidate.paths {
             match self.api.open_path(&candidate_path.path) {
                 Ok(device) => paths.push(OpenPath {
-                    #[cfg(target_os = "windows")]
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
                     path: candidate_path.path.clone(),
                     device: Arc::new(Mutex::new(device)),
                     layout: candidate_path.layout.clone(),
@@ -850,12 +924,12 @@ impl HidSession {
             open.paths
                 .iter()
                 .map(|path| {
-                    #[cfg(target_os = "windows")]
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
                     let device =
                         ReaderHandle::Owned(self.api.open_path(&path.path).map_err(|error| {
                             format!("could not open HID input reader: {error}")
                         })?);
-                    #[cfg(not(target_os = "windows"))]
+                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                     let device = ReaderHandle::Shared(Arc::clone(&path.device));
                     Ok((
                         device,
@@ -881,40 +955,15 @@ impl HidSession {
             let reader = thread::Builder::new()
                 .name(format!("openmouse-hid-{key}-{index}"))
                 .spawn(move || {
-                    let mut buffer = vec![0; buffer_len];
-                    while !thread_stop.load(Ordering::Acquire) {
-                        match device.read(&mut buffer) {
-                            Ok(0) => {}
-                            Ok(size) => {
-                                let (report_id, data) = if uses_report_ids {
-                                    (buffer[0], buffer[1..size].to_vec())
-                                } else {
-                                    (0, buffer[..size].to_vec())
-                                };
-                                if tx
-                                    .send(InputReport {
-                                        kind: "inputreport",
-                                        device: device_key.clone(),
-                                        report_id,
-                                        data,
-                                    })
-                                    .is_err()
-                                {
-                                    thread_stop.store(true, Ordering::Release);
-                                    break;
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    device = %device_key,
-                                    interface = index,
-                                    %error,
-                                    "Native HID input reader stopped"
-                                );
-                                break;
-                            }
-                        }
-                    }
+                    run_reader(
+                        |buffer| device.read(buffer),
+                        &thread_stop,
+                        &tx,
+                        &device_key,
+                        index,
+                        buffer_len,
+                        uses_report_ids,
+                    );
                 });
             match reader {
                 Ok(reader) => open.readers.push(reader),
@@ -1774,8 +1823,8 @@ pub async fn serve(mut socket: WebSocket) {
         }
     }
 
-    // Dropping the session joins its reader threads, which can wait out a
-    // read timeout per path.
+    // Dropping the session joins its reader threads. Every reader is told to
+    // stop first, so this waits out about one read timeout in total.
     let _ = tokio::task::spawn_blocking(move || drop(session)).await;
     note_session_ended(session_id);
     tracing::info!(session_id, "HID websocket disconnected");
@@ -2016,6 +2065,153 @@ mod tests {
             grouped_device_key(0x1532, 0x00b0, b"same", Some("same")),
             grouped_device_key(0x1532, 0x00b0, b"same", None)
         );
+    }
+
+    /// A blocking reader: each read either returns the next scripted report
+    /// or waits out the timeout and returns 0, like `read_timeout` on an
+    /// owned handle with no input pending.
+    fn scripted_read(
+        mut reports: Vec<Vec<u8>>,
+        timeout: Duration,
+        reads: Arc<AtomicUsize>,
+    ) -> impl FnMut(&mut [u8]) -> Result<usize, String> {
+        reports.reverse();
+        move |buffer| {
+            reads.fetch_add(1, Ordering::Relaxed);
+            match reports.pop() {
+                Some(report) => {
+                    buffer[..report.len()].copy_from_slice(&report);
+                    Ok(report.len())
+                }
+                None => {
+                    thread::sleep(timeout);
+                    Ok(0)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reader_forwards_reports_and_stops_within_one_read_timeout() {
+        let (tx, mut rx, failure) = input_channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let timeout = Duration::from_millis(50);
+        let read = scripted_read(
+            vec![vec![3, 10, 11], vec![4, 12]],
+            timeout,
+            Arc::clone(&reads),
+        );
+        let thread_stop = Arc::clone(&stop);
+        let reader = thread::spawn(move || {
+            run_reader(read, &thread_stop, &tx, "hid-test", 0, 8, true);
+        });
+        let first = rx.blocking_recv().unwrap();
+        assert_eq!((first.report_id, first.data), (3, vec![10, 11]));
+        let second = rx.blocking_recv().unwrap();
+        assert_eq!((second.device.as_str(), second.report_id), ("hid-test", 4));
+        assert_eq!(second.data, vec![12]);
+        // Idle: a blocking read waits out its timeout instead of spinning.
+        thread::sleep(timeout * 4);
+        assert!(
+            reads.load(Ordering::Relaxed) <= 2 + 5,
+            "reader spun while idle"
+        );
+        let asked = Instant::now();
+        stop.store(true, Ordering::Release);
+        reader.join().unwrap();
+        assert!(asked.elapsed() < timeout * 4, "{:?}", asked.elapsed());
+        assert!(!*failure.borrow());
+    }
+
+    #[test]
+    fn reader_without_report_ids_keeps_the_whole_buffer_and_stops_on_error() {
+        let (tx, mut rx, _failure) = input_channel();
+        let stop = AtomicBool::new(false);
+        let mut calls = 0;
+        run_reader(
+            |buffer: &mut [u8]| {
+                calls += 1;
+                if calls == 1 {
+                    buffer[..2].copy_from_slice(&[9, 8]);
+                    Ok(2)
+                } else {
+                    Err("device unplugged".into())
+                }
+            },
+            &stop,
+            &tx,
+            "hid-test",
+            1,
+            8,
+            false,
+        );
+        let report = rx.try_recv().unwrap();
+        assert_eq!((report.report_id, report.data), (0, vec![9, 8]));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn reader_stops_itself_when_the_input_queue_overflows() {
+        let (tx, _rx, failure) = input_channel();
+        let stop = AtomicBool::new(false);
+        run_reader(
+            |buffer: &mut [u8]| {
+                buffer[0] = 1;
+                Ok(2)
+            },
+            &stop,
+            &tx,
+            "hid-test",
+            0,
+            8,
+            true,
+        );
+        assert!(stop.load(Ordering::Acquire));
+        assert!(*failure.borrow());
+    }
+
+    #[test]
+    fn ending_a_session_stops_every_reader_before_joining_any() {
+        let (input_tx, _, _) = input_channel();
+        let mut session = HidSession::new(u64::MAX - 41_141, input_tx).unwrap();
+        let flags = (0..3)
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect::<Vec<_>>();
+        let all_saw_every_stop = Arc::new(AtomicBool::new(true));
+        for (index, flag) in flags.iter().enumerate() {
+            let own = Arc::clone(flag);
+            let others = flags.clone();
+            let verdict = Arc::clone(&all_saw_every_stop);
+            // Each reader exits once asked, but only after every other reader
+            // was asked too (or 2 s pass): a session that joins one reader
+            // before telling the next to stop makes the first one time out.
+            let reader = thread::spawn(move || {
+                while !own.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !others.iter().all(|flag| flag.load(Ordering::Acquire)) {
+                    if Instant::now() >= deadline {
+                        verdict.store(false, Ordering::Release);
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            });
+            session.open_devices.insert(
+                format!("hid-test-{index}"),
+                OpenDevice {
+                    paths: Vec::new(),
+                    vendor_id: 0,
+                    listening: true,
+                    stop: Some(Arc::clone(flag)),
+                    readers: vec![reader],
+                },
+            );
+        }
+        drop(session);
+        assert!(all_saw_every_stop.load(Ordering::Acquire));
     }
 
     #[test]
