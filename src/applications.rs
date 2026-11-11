@@ -53,6 +53,7 @@ mod imp {
     };
 
     use super::{ApplicationInfo, icon_id};
+    use crate::games::GameDetector;
 
     const ICON_SIZE: u32 = 48;
 
@@ -61,7 +62,8 @@ mod imp {
         applications: BTreeMap<String, ApplicationInfo>,
     }
 
-    pub fn visible_applications() -> Vec<ApplicationInfo> {
+    /// Windows lists applications by their visible windows, not processes.
+    pub fn visible_applications(_processes: &GameDetector) -> Vec<ApplicationInfo> {
         let mut collection = WindowCollection {
             foreground: unsafe { GetForegroundWindow() },
             applications: BTreeMap::new(),
@@ -242,8 +244,9 @@ mod imp {
     use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 
     use super::{ApplicationInfo, icon_id};
+    use crate::games::GameDetector;
 
-    pub fn visible_applications() -> Vec<ApplicationInfo> {
+    pub fn visible_applications(_processes: &GameDetector) -> Vec<ApplicationInfo> {
         let workspace = NSWorkspace::sharedWorkspace();
         let mut applications = BTreeMap::new();
         for application in workspace.runningApplications().iter() {
@@ -291,33 +294,26 @@ mod imp {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    use sysinfo::Pid;
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
 
     use super::{ApplicationInfo, icon_id};
+    use crate::games::GameDetector;
 
-    /// Lists one entry per running process: `sysinfo` sees every process, but
-    /// X11 only knows mapped windows, and matching the two for every process
-    /// each poll costs a round trip per PID. Like macOS, only the foreground
-    /// entry is matched to a window; on Wayland (no X connection) every
-    /// entry reports `foreground: false`, so game-profile fallback still
-    /// works but focus matching does not.
-    pub fn visible_applications() -> Vec<ApplicationInfo> {
+    /// Lists one entry per running process of the detector's last scan:
+    /// `sysinfo` sees every process, but X11 only knows mapped windows, and
+    /// matching the two for every process each poll costs a round trip per
+    /// PID. Like macOS, only the foreground entry is matched to a window; on
+    /// Wayland (no X connection) every entry reports `foreground: false`, so
+    /// game-profile fallback still works but focus matching does not.
+    pub fn visible_applications(processes: &GameDetector) -> Vec<ApplicationInfo> {
         let foreground_pid = active_window_pid();
-        let mut system = System::new();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
-        );
         let mut applications = BTreeMap::new();
-        for process in system.processes().values() {
-            // A Proton game reports the Windows program Wine runs, not the
-            // Wine loader every game shares.
-            let Some((path, executable)) = crate::games::process_program(process) else {
-                continue;
-            };
+        // A Proton game reports the Windows program Wine runs, not the Wine
+        // loader every game shares (`process_program`).
+        for (process, path, executable) in processes.programs() {
+            let (path, executable) = (path.to_owned(), executable.to_owned());
             if executable.is_empty() {
                 continue;
             }
@@ -419,7 +415,7 @@ mod imp {
 mod imp {
     use super::ApplicationInfo;
 
-    pub fn visible_applications() -> Vec<ApplicationInfo> {
+    pub fn visible_applications(_processes: &crate::games::GameDetector) -> Vec<ApplicationInfo> {
         Vec::new()
     }
 

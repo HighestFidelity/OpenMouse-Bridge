@@ -1731,13 +1731,32 @@ impl BridgeService {
                         state.config.local_applications.clone(),
                     )
                 };
-                let mut active = detector.detect(&games);
-                let processes = detector.running_processes();
-                active.extend(crate::games::matches_local_games(
-                    &local_applications,
-                    &processes,
-                ));
-                let running = applications::visible_applications();
+                // One process scan per tick, off the async workers: it reads
+                // /proc (or lists windows) for every process.
+                let mut scanner = std::mem::take(&mut detector);
+                let scan_input = (games.clone(), local_applications.clone());
+                let (scanner, active, processes, running) =
+                    match tokio::task::spawn_blocking(move || {
+                        let (games, local_applications) = scan_input;
+                        scanner.refresh();
+                        let mut active = scanner.matches(&games);
+                        let processes = scanner.running_processes();
+                        active.extend(crate::games::matches_local_games(
+                            &local_applications,
+                            &processes,
+                        ));
+                        let running = applications::visible_applications(&scanner);
+                        (scanner, active, processes, running)
+                    })
+                    .await
+                    {
+                        Ok(scan) => scan,
+                        Err(error) if error.is_panic() => {
+                            std::panic::resume_unwind(error.into_panic())
+                        }
+                        Err(_) => return,
+                    };
+                detector = scanner;
                 let applications = profile_applications(&running, &games, &local_applications);
                 // Icon extraction can be disabled by callers that never serve
                 // the application's icon endpoint.
@@ -1754,10 +1773,26 @@ impl BridgeService {
                             })
                             .collect::<Vec<_>>()
                     };
-                    missing_icons
-                        .into_iter()
-                        .map(|(icon_id, path)| (icon_id, applications::application_icon(&path)))
-                        .collect::<Vec<_>>()
+                    if missing_icons.is_empty() {
+                        Vec::new()
+                    } else {
+                        match tokio::task::spawn_blocking(move || {
+                            missing_icons
+                                .into_iter()
+                                .map(|(icon_id, path)| {
+                                    (icon_id, applications::application_icon(&path))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .await
+                        {
+                            Ok(icons) => icons,
+                            Err(error) if error.is_panic() => {
+                                std::panic::resume_unwind(error.into_panic())
+                            }
+                            Err(_) => return,
+                        }
+                    }
                 } else {
                     Vec::new()
                 };
