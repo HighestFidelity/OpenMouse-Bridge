@@ -108,6 +108,13 @@ impl NativeAutomation {
         self.observed_manual = *intent;
     }
 
+    /// Makes the next reconcile write its desired profile even if that is
+    /// the one already applied (the web panel may have changed the mouse in
+    /// between). Owed until a reconcile actually runs the apply.
+    pub fn reapply_on_next_reconcile(&mut self) {
+        self.apply_deferred = true;
+    }
+
     pub fn pending_restores_for(&self, desired: Option<&ApplicationProfile>) -> usize {
         self.entries
             .iter()

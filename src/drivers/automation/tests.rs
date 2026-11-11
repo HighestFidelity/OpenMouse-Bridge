@@ -541,3 +541,30 @@ fn an_unaddressable_zaunkoenig_profile_is_a_real_error() {
         );
     }
 }
+
+#[test]
+fn a_requested_reapply_writes_the_same_profile_once_more() {
+    let mut automation = NativeAutomation::default();
+    let mut io = FakeIo::default();
+    let game = profile("a", Some(1600), None);
+    automation.reconcile(Some(&game), &mut io).unwrap();
+    // The web panel had the mouse: write the profile again, keeping the
+    // original baseline (no second read) for the later restore.
+    automation.reapply_on_next_reconcile();
+    automation.reconcile(Some(&game), &mut io).unwrap();
+    automation.reconcile(Some(&game), &mut io).unwrap();
+    assert_eq!(
+        io.calls,
+        [
+            "read:a",
+            "write:a:Some(1600):None",
+            "write:a:Some(1600):None"
+        ]
+    );
+    assert_eq!(automation.entries["a"].baseline.dpi, 800);
+    // With no profile in force there is nothing to write.
+    let mut idle = NativeAutomation::default();
+    idle.reapply_on_next_reconcile();
+    idle.reconcile(None, &mut io).unwrap();
+    assert_eq!(io.calls.len(), 3);
+}
