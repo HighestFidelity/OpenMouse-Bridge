@@ -5,8 +5,9 @@ on:
     - cron: '17 9 * * *'
   workflow_dispatch:
 
-# GITHUB_TOKEN only checks out and reads the protocol release; the branch,
-# pull request and merge use PROTOCOL_UPDATE_TOKEN.
+# GITHUB_TOKEN only checks out and reads the protocol release; the branch and
+# pull request use PROTOCOL_UPDATE_TOKEN. A maintainer reviews and merges the
+# PR: new protocol code ships signed with HID access, so it never auto-merges.
 permissions:
   contents: read
 
@@ -61,20 +62,13 @@ jobs:
           NODE
           npm install --prefix native-hid --package-lock-only --ignore-scripts
       - uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
-        id: pr
         with:
           token: ${{ secrets.PROTOCOL_UPDATE_TOKEN }}
           branch: automation/update-mouse-protocol
           delete-branch: true
           title: 'chore: update mouse protocol to ${{ steps.release.outputs.tag }}'
-          body: 'Updates the bundled mouse protocol. This PR merges automatically after the required macOS, Windows, and Linux checks pass.'
+          body: 'Updates the bundled mouse protocol. Review the protocol diff and merge by hand once the macOS, Windows, and Linux checks pass; it does not merge automatically.'
           commit-message: 'chore: update mouse protocol to ${{ steps.release.outputs.tag }}'
           add-paths: |
             native-hid/package.json
             native-hid/package-lock.json
-      - name: Merge when required checks pass
-        if: steps.pr.outputs.pull-request-number != ''
-        env:
-          GH_TOKEN: ${{ secrets.PROTOCOL_UPDATE_TOKEN }}
-          PR_NUMBER: ${{ steps.pr.outputs.pull-request-number }}
-        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch
