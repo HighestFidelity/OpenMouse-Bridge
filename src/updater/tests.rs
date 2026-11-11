@@ -1190,3 +1190,48 @@ fn checksum_files_name_their_archive() {
     assert_eq!(checksum_file_name(b"abc"), None);
     assert_eq!(checksum_file_name(b"abc a.zip b.zip"), None);
 }
+
+/// Serves `latest.json` and, if given, `latest.json.sig` on loopback.
+async fn serve_feed(feed: &'static [u8], signature: Option<Vec<u8>>) -> String {
+    use axum::{Router, routing::get};
+    let mut app = Router::new().route("/latest.json", get(move || async move { feed }));
+    if let Some(signature) = signature {
+        app = app.route(
+            "/latest.json.sig",
+            get(move || async move { signature.clone() }),
+        );
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{address}/latest.json")
+}
+
+#[tokio::test]
+async fn signed_feeds_are_checked_end_to_end() {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    const FEED: &[u8] = br#"{"version":"9.9.9","notes":"- n","platforms":{}}"#;
+    let rng = ring::rand::SystemRandom::new();
+    let pair = |rng| {
+        Ed25519KeyPair::from_pkcs8(Ed25519KeyPair::generate_pkcs8(rng).unwrap().as_ref()).unwrap()
+    };
+    let signer = pair(&rng);
+    let key: [u8; 32] = signer.public_key().as_ref().try_into().unwrap();
+    let good = signer.sign(FEED).as_ref().to_vec();
+    let forged = pair(&rng).sign(FEED).as_ref().to_vec();
+
+    // No key built in: unsigned feeds work as before.
+    let unsigned = serve_feed(FEED, None).await;
+    assert_eq!(fetch_feed(&unsigned, None).await.unwrap().version, "9.9.9");
+    // Key built in: a good signature passes; missing or forged ones refuse.
+    let signed = serve_feed(FEED, Some(good)).await;
+    assert_eq!(
+        fetch_feed(&signed, Some(key)).await.unwrap().version,
+        "9.9.9"
+    );
+    let error = fetch_feed(&unsigned, Some(key)).await.unwrap_err();
+    assert!(format!("{error:#}").contains("no signature"), "{error:#}");
+    let forged = serve_feed(FEED, Some(forged)).await;
+    let error = fetch_feed(&forged, Some(key)).await.unwrap_err();
+    assert!(format!("{error:#}").contains("does not match"), "{error:#}");
+}
