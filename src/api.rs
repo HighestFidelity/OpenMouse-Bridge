@@ -171,7 +171,7 @@ async fn request_gate(
         request
             .extensions()
             .get::<axum::extract::ConnectInfo<crate::peer::Connection>>()
-            .map(|info| info.0),
+            .map(|info| info.0.clone()),
     )
     .await
     {
@@ -180,14 +180,15 @@ async fn request_gate(
     next.run(request).await
 }
 
-/// Linux: the client socket must belong to this account. Requests without
+/// Linux: the client socket must belong to this account, checked once per
+/// connection and reused by its later requests. Requests without
 /// connection info (a server not started through [`make_service`]) are
 /// refused, except in this crate's unit tests, which drive the router
 /// directly.
 #[cfg(target_os = "linux")]
 async fn peer_is_this_user(connection: Option<crate::peer::Connection>) -> bool {
     match connection {
-        Some(connection) => crate::peer::same_user(connection).await,
+        Some(connection) => connection.same_user().await,
         None => cfg!(test),
     }
 }
@@ -572,11 +573,12 @@ mod tests {
     #[tokio::test]
     async fn unknown_peer_socket_is_refused() {
         let (app, dir) = app();
-        let unknown = crate::peer::Connection {
-            peer: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
-            local: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9))),
-        };
         for uri in ["/v1/status", "/v1/hid"] {
+            // A fresh connection per route, so each one reads the table.
+            let unknown = crate::peer::Connection::new(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+                Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9))),
+            );
             let request = Request::builder()
                 .uri(uri)
                 .header(header::HOST, "127.0.0.1:17846")

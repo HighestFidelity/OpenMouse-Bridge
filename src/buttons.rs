@@ -541,7 +541,7 @@ fn run(
         match incoming.recv_timeout(Duration::from_millis(100)) {
             Ok(Event::Buttons(mask)) => {
                 for step in transitions(&mut in_use, &current(shared), held, mask) {
-                    tracing::info!(mask, ?step, "Acting on a mouse button");
+                    tracing::debug!(mask, ?step, "Acting on a mouse button");
                     execute(step);
                 }
                 held = mask;
