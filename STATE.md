@@ -10,4 +10,12 @@
   N1 signing and N4/N5 feature items stay written up.
 - Workflow changes are not run on a real runner yet.
 
-NEXT: P9-OMB3 in a fresh session: (1) N3 Linux peer-uid check (src/api.rs request_gate + hid_upgrade, /proc/net/tcp{,6} owner uid of the peer socket must equal getuid(), Linux only, tests with fake /proc text); (2) N2 update-mouse-protocol.yml drop --auto, ci.yml never skip fmt/test/clippy on protocol-only PRs. Each on a t3/* worktree branch, merge --no-ff, move N2/N3 to Fixed in the report, push main. Skills: delegation-board.
+
+## 2026-11-11 Update (P9-OMB3, N2 + N3)
+- Merged to main: t3/peer-uid (722b694, N3 -> F17: Linux peer-uid gate, src/peer.rs) and t3/protocol-review (2a55d15, N2 -> F16).
+- Verified: cargo test --locked 264+39+11 pass (6 new), fmt --check and clippy -D warnings clean. Negative check: serving
+  without api::make_service makes 8/11 integration tests 403, so the gate is live outside unit tests.
+- Unverified: macOS/Windows compile (no targets on the box), workflows on a real runner.
+- Pushing main is blocked for agents by git-guardrails: Victor pushes.
+
+NEXT: Victor pushes main (git -C /home/claude/data/AppData/claude-code-custom/projects/openmouse-bridge push origin main). Open items stay N1 (signing), N4/N5 (features), N6-N12. No task queued.
