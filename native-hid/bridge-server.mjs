@@ -2,6 +2,7 @@ import http from 'node:http';
 import { WebSocketServer } from 'ws';
 import { candidateDevices } from './src/hid-device-adapter.mjs';
 import { BRAND_DRIVERS, brandKey } from './src/brands.mjs';
+import { requestAllowed } from './src/request-gate.mjs';
 
 // Polyfill `window` for mouse-protocol drivers that use window.setTimeout.
 globalThis.window ??= globalThis;
@@ -54,7 +55,15 @@ async function probeForBrand(brand) {
 const PORT = 17846;
 
 const server = http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (!requestAllowed(req.headers)) {
+    res.writeHead(403);
+    res.end();
+    return;
+  }
+  if (req.headers.origin) {
+    res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+    res.setHeader('Vary', 'Origin');
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
@@ -97,7 +106,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
-  if (request.url === '/v1/hid') {
+  if (request.url === '/v1/hid' && requestAllowed(request.headers, { requireOrigin: true })) {
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
     });
