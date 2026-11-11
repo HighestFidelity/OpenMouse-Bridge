@@ -1276,8 +1276,25 @@ impl BridgeService {
     pub async fn refresh_game_catalog(&self) {
         match crate::games::fetch_catalog().await {
             Ok(games) => {
-                let mut state = self.inner.write().await;
-                config::apply_fetched_catalog(&self.config_path, &mut state.config, games);
+                // In the config save queue like any other change, so a
+                // settings change made meanwhile neither loses the new
+                // catalog nor is overwritten by it. The save (if the catalog
+                // changed) runs off the async workers; a failed one only
+                // warns, and the catalog is used either way.
+                let _saving = Arc::clone(&self.config_saves).lock_owned().await;
+                let mut next = self.inner.read().await.config.clone();
+                let path = Arc::clone(&self.config_path);
+                let applied = tokio::task::spawn_blocking(move || {
+                    config::apply_fetched_catalog(&path, &mut next, games);
+                    next
+                })
+                .await;
+                match applied {
+                    Ok(next) => self.inner.write().await.config = next,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not apply the fetched game catalog");
+                    }
+                }
             }
             Err(error) => {
                 config::log_catalog_unavailable(&error, &self.inner.read().await.config);
@@ -1789,11 +1806,26 @@ impl BridgeService {
     }
 
     async fn reconcile_native(&self) -> Option<ApplyOutcome> {
+        self.reconcile_native_forced(false).await
+    }
+
+    /// [`Self::reconcile_native`], but the profile in force is written even
+    /// if it was applied already: for the mouse coming back from the web
+    /// panel. If the pass is deferred (a panel session again), the write is
+    /// still owed on the next one.
+    async fn reapply_native(&self) -> Option<ApplyOutcome> {
+        self.reconcile_native_forced(true).await
+    }
+
+    async fn reconcile_native_forced(&self, reapply: bool) -> Option<ApplyOutcome> {
         let automation = self.native_automation.clone();
         self.reconcile_native_with(move |desired| {
             let mut automation = automation
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if reapply {
+                automation.reapply_on_next_reconcile();
+            }
             let result = crate::drivers::reconcile_automatic(&mut automation, desired.as_ref());
             let pending = automation.pending_restores_for(desired.as_ref());
             match result {
@@ -2291,56 +2323,19 @@ fn merge_detected_mice(
 /// simply keeps the memory it already has) and reads the battery right away.
 /// Shared by the startup seed and the panel-disconnect handover.
 async fn resume_onboard(service: &BridgeService) {
-    let profile = {
-        let state = service.inner.read().await;
-        resolve_profile_retaining(
-            &state.config,
-            &state.applications,
-            &state.active_games,
-            &state.processes,
-            None,
-        )
-    };
-    if let Some(profile) = profile {
-        tracing::info!(
-            profile = %profile.application.name,
-            "applying the stored settings to the onboard memory"
-        );
-        std::thread::spawn(move || {
-            apply_natively(&profile);
-        });
+    // The panel drove the mouse live and may have changed its settings, so
+    // the profile in force is written again, through the same serialized
+    // native-automation pass (and restoration journal) as profile switches.
+    match service.reapply_native().await {
+        Some(ApplyOutcome::Applied) => {
+            tracing::info!("applied the stored settings to the onboard memory");
+        }
+        Some(ApplyOutcome::Failed) => {
+            tracing::warn!("could not restore the stored settings to the onboard memory");
+        }
+        Some(ApplyOutcome::NoDriver) | None => {}
     }
     tokio::spawn(poll_batteries(service.clone()));
-}
-
-fn apply_natively(profile: &ApplicationProfile) -> ApplyOutcome {
-    match crate::drivers::apply_profile(profile) {
-        Ok(true) => {
-            tracing::info!(
-                profile = %profile.application.name,
-                device = %profile.device.name,
-                "Applied the mouse profile natively"
-            );
-            ApplyOutcome::Applied
-        }
-        Ok(false) => {
-            tracing::debug!(
-                profile = %profile.application.name,
-                device = %profile.device.name,
-                "No native driver for this device; not applying natively"
-            );
-            ApplyOutcome::NoDriver
-        }
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                profile = %profile.application.name,
-                device = %profile.device.name,
-                "Could not apply the mouse profile natively"
-            );
-            ApplyOutcome::Failed
-        }
-    }
 }
 
 #[cfg(test)]

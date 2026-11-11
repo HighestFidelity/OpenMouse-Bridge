@@ -425,6 +425,9 @@ fn run_server(
         }
         service.start_game_monitor(Arc::new(AtomicBool::new(true)));
         service.start_battery_monitor();
+        // Hybrid mode: restores the stored settings when the web panel lets
+        // go of the mouse (does nothing with Hybrid mode off).
+        service.start_mode_monitor();
 
         let snapshot_service = service.clone();
         let snapshot_publisher = tokio::spawn(async move {
