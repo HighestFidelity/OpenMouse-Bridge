@@ -106,6 +106,7 @@ jobs:
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
           security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$RUNNER_TEMP/certificate.p12"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
           echo "MACOS_SIGN_IDENTITY=$MACOS_SIGN_IDENTITY" >> "$GITHUB_ENV"
@@ -329,10 +330,15 @@ jobs:
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
+          # Written here and removed before this step ends (audit N12).
           $certificate = Join-Path $env:RUNNER_TEMP 'openmouse-bridge.pfx'
           [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
-          & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD target/release/openmouse-bridge.exe
-          if ($LASTEXITCODE -ne 0) { throw 'Signing failed' }
+          try {
+            & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD target/release/openmouse-bridge.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Signing failed' }
+          } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $certificate
+          }
       - name: Prepare native-hid (deps + bundled Node.js runtime)
         shell: pwsh
         run: |
@@ -370,12 +376,19 @@ jobs:
         if: env.HAS_WINDOWS_SIGNING == 'true'
         shell: pwsh
         env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
+          # Written here and removed before this step ends (audit N12).
           $certificate = Join-Path $env:RUNNER_TEMP 'openmouse-bridge.pfx'
-          & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD OpenMouse-Bridge-windows-x64-setup.exe
-          if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          try {
+            & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD OpenMouse-Bridge-windows-x64-setup.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
+          } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $certificate
+          }
           $checksum = (Get-FileHash OpenMouse-Bridge-windows-x64-setup.exe -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' + "`n"
           [IO.File]::WriteAllText('OpenMouse-Bridge-windows-x64-setup.exe.sha256', $checksum, [Text.UTF8Encoding]::new($false))
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

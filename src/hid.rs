@@ -1452,6 +1452,11 @@ struct CollectionNode {
     parent: Option<usize>,
 }
 
+/// Deepest collection nesting accepted. Real devices nest a handful deep; a
+/// descriptor from a hostile device could otherwise nest ~1,400 deep and
+/// drive the recursive tree building and serialization (audit N12).
+const MAX_COLLECTION_DEPTH: usize = 64;
+
 fn parse_report_descriptor(bytes: &[u8]) -> Result<(Vec<CollectionInfo>, ReportLayout), String> {
     let mut globals = GlobalState::default();
     let mut global_stack = Vec::new();
@@ -1510,6 +1515,9 @@ fn parse_report_descriptor(bytes: &[u8]) -> Result<(Vec<CollectionInfo>, ReportL
                 (u32::from(globals.usage_page) << 16) | (value & 0xffff)
             }),
             (0, 10) => {
+                if collections.len() >= MAX_COLLECTION_DEPTH {
+                    return Err("HID descriptor nests collections too deep".into());
+                }
                 let usage = usages.first().copied().unwrap_or(0);
                 let index = nodes.len();
                 let parent = collections.last().copied();
@@ -2174,6 +2182,19 @@ mod tests {
             collections[0].children[0].input_reports[0].items[0].report_size,
             1
         );
+    }
+
+    #[test]
+    fn descriptor_nesting_is_capped() {
+        let nested = |depth: usize| {
+            let mut descriptor = vec![0x06, 0x00, 0xff, 0x09, 0x01];
+            descriptor.extend(std::iter::repeat_n([0xa1, 0x02], depth).flatten());
+            descriptor.extend(std::iter::repeat_n(0xc0, depth));
+            descriptor
+        };
+        assert!(parse_report_descriptor(&nested(MAX_COLLECTION_DEPTH)).is_ok());
+        assert!(parse_report_descriptor(&nested(MAX_COLLECTION_DEPTH + 1)).is_err());
+        assert!(parse_report_descriptor(&nested(1_400)).is_err());
     }
 
     #[test]
