@@ -52,6 +52,18 @@ jobs:
             missing=1
           fi
           exit "$missing"
+      # With an update signing key built into the app (audit N1), every
+      # release must be signed or installed Bridges refuse the update.
+      - name: Require the update signing key when the app checks signatures
+        env:
+          HAS_UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY != '' }}
+        run: |
+          set -euo pipefail
+          line="$(grep -E '^pub\(super\) const UPDATE_PUBLIC_KEY_HEX: &str = "[0-9a-f]*";$' src/updater/signature.rs)"
+          if [ "$line" != 'pub(super) const UPDATE_PUBLIC_KEY_HEX: &str = "";' ] && [ "$HAS_UPDATE_SIGNING_KEY" != true ]; then
+            echo '::error::src/updater/signature.rs has an update signing key but UPDATE_SIGNING_KEY is not set.'
+            exit 1
+          fi
       - name: Verify CHANGELOG.md has an entry for this version
         run: |
           node --input-type=module -e '
@@ -471,6 +483,38 @@ jobs:
           mkdir release
           node .github/scripts/make-release-files.mjs "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" artifacts release
           cat release/latest.json
+      # Signs latest.json and every .sha256 with UPDATE_SIGNING_KEY (an
+      # ed25519 PEM) as raw 64-byte .sig files, which src/updater/signature.rs
+      # checks against its built-in public key. The key must match that one.
+      - name: Sign the update metadata
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          expected="$(grep -E '^pub\(super\) const UPDATE_PUBLIC_KEY_HEX: &str = "[0-9a-f]*";$' src/updater/signature.rs | sed 's/.*= "\(.*\)";$/\1/')"
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            if [ -n "$expected" ]; then
+              echo '::error::UPDATE_SIGNING_KEY is not set but the app requires signed updates.'
+              exit 1
+            fi
+            echo 'No update signing key built in or set: publishing unsigned metadata.'
+            exit 0
+          fi
+          umask 077
+          key="$RUNNER_TEMP/update-signing.pem"
+          public="$RUNNER_TEMP/update-signing.pub.pem"
+          trap 'rm -f "$key" "$public"' EXIT
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key"
+          openssl pkey -in "$key" -pubout -out "$public"
+          actual="$(openssl pkey -pubin -in "$public" -outform DER | tail -c 32 | od -An -tx1 -v | tr -d ' \n')"
+          if [ "$actual" != "$expected" ]; then
+            echo '::error::UPDATE_SIGNING_KEY does not match UPDATE_PUBLIC_KEY_HEX in src/updater/signature.rs.'
+            exit 1
+          fi
+          for file in release/latest.json artifacts/*.sha256; do
+            openssl pkeyutl -sign -rawin -inkey "$key" -in "$file" -out "$file.sig"
+            openssl pkeyutl -verify -rawin -pubin -inkey "$public" -in "$file" -sigfile "$file.sig"
+          done
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -480,8 +524,12 @@ jobs:
           # may add assets that are missing, but an asset that exists makes
           # the upload fail. To re-cut, delete the release by hand or bump the
           # version.
+          files=(artifacts/* release/latest.json)
+          if [ -f release/latest.json.sig ]; then
+            files+=(release/latest.json.sig)
+          fi
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" artifacts/* release/latest.json
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${files[@]}"
             gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file release/notes.md
           else
             # Pre-release tags (v1.2.0-rc.1) are never latest, so the
@@ -500,5 +548,5 @@ jobs:
               --verify-tag \
               --notes-file release/notes.md \
               "${channel[@]}" \
-              artifacts/* release/latest.json
+              "${files[@]}"
           fi

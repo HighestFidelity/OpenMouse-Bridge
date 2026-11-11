@@ -29,6 +29,7 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MACOS_APP_NAME: &str = "OpenMouse Bridge.app";
 
 mod feed;
+mod signature;
 
 #[derive(Clone, Debug)]
 pub struct UpdateInfo {
@@ -45,6 +46,8 @@ enum UpdateSource {
     Legacy {
         archive_url: String,
         checksum_url: String,
+        /// `<archive>.sha256.sig`, when a signing key is built in.
+        signature_url: Option<String>,
     },
     /// This install's asset in `latest.json`.
     Feed {
@@ -92,6 +95,18 @@ pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
         .error_for_status()
         .with_context(|| format!("update check failed for {url}"))?;
     let bytes = read_bounded_response(response, MAX_RELEASE_BYTES).await?;
+    if let Some(key) = signature::configured_key()? {
+        let signature_url = format!("{url}{}", signature::SIGNATURE_SUFFIX);
+        let signature = download(
+            &client,
+            &signature_url,
+            signature::MAX_SIGNATURE_BYTES,
+            false,
+        )
+        .await
+        .context("latest.json has no signature; refusing the update")?;
+        signature::verify(&key, &bytes, &signature, "latest.json")?;
+    }
     let latest: feed::Feed =
         serde_json::from_slice(&bytes).context("could not parse latest.json")?;
     let kind = feed::current_install_kind();
@@ -322,11 +337,19 @@ async fn prepare_claimed(update: &UpdateInfo) -> Result<ApplyPlan> {
         UpdateSource::Legacy {
             archive_url,
             checksum_url,
+            signature_url,
         } => {
-            let (archive, checksum) = tokio::try_join!(
-                download(&client, archive_url, MAX_ARCHIVE_BYTES, true),
-                download(&client, checksum_url, MAX_CHECKSUM_BYTES, false),
-            )?;
+            // The signature is checked before the archive is downloaded.
+            let checksum = download(&client, checksum_url, MAX_CHECKSUM_BYTES, false).await?;
+            if let Some(key) = signature::configured_key()? {
+                let url = signature_url
+                    .as_deref()
+                    .context("the update checksum has no signature; refusing the update")?;
+                let signature =
+                    download(&client, url, signature::MAX_SIGNATURE_BYTES, false).await?;
+                signature::verify(&key, &checksum, &signature, "the update checksum")?;
+            }
+            let archive = download(&client, archive_url, MAX_ARCHIVE_BYTES, true).await?;
             verify_checksum(&archive, &checksum)?;
             spawn_staging(move || prepare_archive(&archive, &version)).await
         }
@@ -453,12 +476,21 @@ fn package_update(release: &Release, available: Version) -> Result<UpdateInfo> {
     let checksum_name = format!("{archive_name}.sha256");
     let archive_url = asset_url(&release.assets, archive_name)?;
     let checksum_url = asset_url(&release.assets, &checksum_name)?;
+    let signature_url = signature::configured_key()?
+        .map(|_| {
+            asset_url(
+                &release.assets,
+                &format!("{checksum_name}{}", signature::SIGNATURE_SUFFIX),
+            )
+        })
+        .transpose()?;
     Ok(UpdateInfo {
         version: available.to_string(),
         notes: String::new(),
         source: UpdateSource::Legacy {
             archive_url,
             checksum_url,
+            signature_url,
         },
     })
 }
