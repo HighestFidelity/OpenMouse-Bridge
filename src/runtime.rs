@@ -26,6 +26,7 @@ use std::io::Cursor;
 use tokio::{
     net::TcpListener,
     sync::{mpsc as tokio_mpsc, oneshot},
+    task::JoinHandle,
 };
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use tray_icon::Icon;
@@ -366,7 +367,7 @@ fn run_server(
     shutdown: oneshot::Receiver<()>,
     ready: SyncSender<Result<Startup, String>>,
     snapshots: SyncSender<BridgeSnapshot>,
-    mut commands: tokio_mpsc::UnboundedReceiver<BridgeCommand>,
+    commands: tokio_mpsc::UnboundedReceiver<BridgeCommand>,
     update_events: SyncSender<UpdateEvent>,
     notices: NoticeSink,
     panel_requests: Sender<()>,
@@ -416,145 +417,15 @@ fn run_server(
         service.on_show_panel(move || {
             let _ = panel_requests.send(());
         });
-        // The cached catalog serves until the fresh one arrives.
-        let catalog_service = service.clone();
-        let catalog_refresh =
-            tokio::spawn(async move { catalog_service.refresh_game_catalog().await });
-        if let Err(error) = service.enable_autostart_once().await {
-            tracing::warn!(%error, "Could not turn on launch at login");
-        }
-        service.start_game_monitor(Arc::new(AtomicBool::new(true)));
-        service.start_battery_monitor();
-        // Hybrid mode: restores the stored settings when the web panel lets
-        // go of the mouse (does nothing with Hybrid mode off).
-        service.start_mode_monitor();
-
-        let snapshot_service = service.clone();
-        let snapshot_publisher = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                // Nobody listens in headless mode: stop building snapshots.
-                if let Err(mpsc::TrySendError::Disconnected(_)) =
-                    snapshots.try_send(snapshot_service.snapshot().await)
-                {
-                    return;
-                }
-            }
-        });
-
-        // Update work runs apart from the tray commands, one job at a time in
-        // the order asked, so a 10-minute download never holds up a setting.
-        let (update_jobs, queued_update_jobs) = tokio_mpsc::unbounded_channel();
-        let worker_events = update_events.clone();
-        let update_worker = tokio::spawn(run_serially(queued_update_jobs, move |job| {
-            run_update_job(job, worker_events.clone())
-        }));
-
-        let timer_service = service.clone();
-        let timer_jobs = update_jobs.clone();
-        let update_timer = tokio::spawn(async move {
-            if updater::is_stub_install() {
-                return;
-            }
-            loop {
-                tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
-                if timer_service.snapshot().await.automatic_updates {
-                    let _ = timer_jobs.send(UpdateJob::Check {
-                        install_automatically: true,
-                    });
-                }
-            }
-        });
-
-        let command_service = service.clone();
-        let command_handler = tokio::spawn(async move {
-            // An update helper that failed left a note for this launch.
-            if let Some(error) = updater::take_last_failure() {
-                tracing::warn!(%error, "the last Bridge update did not install");
-                let _ = update_events.try_send(UpdateEvent::Failed(error));
-            }
-            // A stub install can't run its HID helper yet; finishing it comes
-            // before any ordinary update check.
-            if updater::is_stub_install() {
-                tokio::spawn(finish_stub_install(update_events.clone()));
-            } else if automatic_updates {
-                let _ = update_jobs.send(UpdateJob::Check {
-                    install_automatically: true,
-                });
-            }
-            while let Some(command) = commands.recv().await {
-                match command {
-                    BridgeCommand::SetBatteryThreshold(percent) => {
-                        if let Err(error) = command_service.set_battery_threshold(percent).await {
-                            tracing::error!(%error, "could not save Bridge settings");
-                        }
-                    }
-                    BridgeCommand::SetNotificationSound(enabled) => {
-                        if let Err(error) = command_service.set_notification_sound(enabled).await {
-                            tracing::error!(%error, "could not save Bridge settings");
-                        }
-                    }
-                    BridgeCommand::SetNotificationVolume(percent) => {
-                        if let Err(error) = command_service.set_notification_volume(percent).await {
-                            tracing::error!(%error, "could not save Bridge settings");
-                        }
-                    }
-                    BridgeCommand::SetAutomaticUpdates(enabled) => {
-                        match command_service.set_automatic_updates(enabled).await {
-                            Ok(()) if enabled => {
-                                let _ = update_jobs.send(UpdateJob::Check {
-                                    install_automatically: true,
-                                });
-                            }
-                            Ok(()) => {}
-                            Err(error) => {
-                                tracing::error!(%error, "could not save Bridge settings");
-                            }
-                        }
-                    }
-                    BridgeCommand::SetHybridMode(enabled) => {
-                        if let Err(error) = command_service.set_hybrid_mode(enabled).await {
-                            tracing::error!(%error, "could not save Bridge settings");
-                        }
-                    }
-                    BridgeCommand::SetTrayBatteryStyle(style) => {
-                        if let Err(error) = command_service
-                            .set_tray_battery_style(style.as_config_str())
-                            .await
-                        {
-                            tracing::error!(%error, "could not save Bridge settings");
-                        }
-                    }
-                    BridgeCommand::CheckForUpdates => {
-                        let _ = update_jobs.send(UpdateJob::Check {
-                            install_automatically: false,
-                        });
-                    }
-                    BridgeCommand::InstallUpdate(update) => {
-                        let _ = update_jobs.send(UpdateJob::Install(update));
-                    }
-                    // Queued behind a download still running, as before, so
-                    // it restarts into what that download stages.
-                    BridgeCommand::ApplyUpdate => {
-                        let _ = update_jobs.send(UpdateJob::Apply);
-                    }
-                    BridgeCommand::ForgetBattery(device_id) => {
-                        command_service.forget_battery(&device_id).await;
-                    }
-                    BridgeCommand::AcknowledgeTrayHint => {
-                        if let Err(error) = command_service.acknowledge_tray_hint().await {
-                            tracing::error!(%error, "could not save Bridge settings");
-                        }
-                    }
-                    BridgeCommand::AcknowledgeWhatsNew => {
-                        if let Err(error) = command_service.acknowledge_whats_new().await {
-                            tracing::error!(%error, "could not save Bridge settings");
-                        }
-                    }
-                }
-            }
-        });
+        let tasks = start_background(
+            &service,
+            SystemHost,
+            snapshots,
+            commands,
+            update_events,
+            automatic_updates,
+        )
+        .await;
 
         tracing::info!(%address, config = %path.display(), "OpenMouse Bridge is ready");
         // Only now is this the one Bridge running, so nothing else can be
@@ -578,11 +449,7 @@ fn run_server(
         if let Some(focus) = focus {
             let _ = tokio::task::spawn_blocking(move || drop(focus)).await;
         }
-        catalog_refresh.abort();
-        snapshot_publisher.abort();
-        update_timer.abort();
-        command_handler.abort();
-        update_worker.abort();
+        tasks.abort();
         outcome?;
         Ok(())
     });
@@ -591,6 +458,253 @@ fn run_server(
     // update hand-off. The update helper is already started by then.
     runtime.shutdown_timeout(SHUTDOWN_GRACE);
     outcome
+}
+
+/// What starting the server reaches outside the process for: the network,
+/// HID and the process list, the login item, and the updater's files.
+/// [`SystemHost`] is the real one; the tests pass a fake, so
+/// [`start_background`] runs without any of them.
+trait Host: Clone + Send + Sync + 'static {
+    fn refresh_game_catalog(
+        &self,
+        service: BridgeService,
+    ) -> impl Future<Output = ()> + Send + use<Self>;
+    fn enable_autostart_once(&self, service: &BridgeService) -> impl Future<Output = Result<()>>;
+    /// The game and battery monitors.
+    fn start_device_monitors(&self, service: &BridgeService);
+    fn is_stub_install(&self) -> bool;
+    fn take_last_update_failure(&self) -> Option<String>;
+    fn finish_stub_install(
+        &self,
+        events: SyncSender<UpdateEvent>,
+    ) -> impl Future<Output = ()> + Send + use<Self>;
+    fn run_update_job(
+        &self,
+        job: UpdateJob,
+        events: SyncSender<UpdateEvent>,
+    ) -> impl Future<Output = ()> + Send + use<Self>;
+}
+
+#[derive(Clone, Copy)]
+struct SystemHost;
+
+impl Host for SystemHost {
+    fn refresh_game_catalog(
+        &self,
+        service: BridgeService,
+    ) -> impl Future<Output = ()> + Send + use<> {
+        async move { service.refresh_game_catalog().await }
+    }
+
+    fn enable_autostart_once(&self, service: &BridgeService) -> impl Future<Output = Result<()>> {
+        service.enable_autostart_once()
+    }
+
+    fn start_device_monitors(&self, service: &BridgeService) {
+        service.start_game_monitor(Arc::new(AtomicBool::new(true)));
+        service.start_battery_monitor();
+    }
+
+    fn is_stub_install(&self) -> bool {
+        updater::is_stub_install()
+    }
+
+    fn take_last_update_failure(&self) -> Option<String> {
+        updater::take_last_failure()
+    }
+
+    fn finish_stub_install(
+        &self,
+        events: SyncSender<UpdateEvent>,
+    ) -> impl Future<Output = ()> + Send + use<> {
+        finish_stub_install(events)
+    }
+
+    fn run_update_job(
+        &self,
+        job: UpdateJob,
+        events: SyncSender<UpdateEvent>,
+    ) -> impl Future<Output = ()> + Send + use<> {
+        run_update_job(job, events)
+    }
+}
+
+/// The tasks [`start_background`] spawned, stopped together with the server.
+struct BackgroundTasks {
+    catalog_refresh: JoinHandle<()>,
+    snapshot_publisher: JoinHandle<()>,
+    update_timer: JoinHandle<()>,
+    command_handler: JoinHandle<()>,
+    update_worker: JoinHandle<()>,
+}
+
+impl BackgroundTasks {
+    fn abort(self) {
+        self.catalog_refresh.abort();
+        self.snapshot_publisher.abort();
+        self.update_timer.abort();
+        self.command_handler.abort();
+        self.update_worker.abort();
+    }
+}
+
+/// Everything the server runs beside its HTTP API once the config is loaded:
+/// the catalog refresh, the monitors, the snapshot publisher, the update
+/// worker and timer, and the tray command loop.
+async fn start_background(
+    service: &BridgeService,
+    host: impl Host,
+    snapshots: SyncSender<BridgeSnapshot>,
+    mut commands: tokio_mpsc::UnboundedReceiver<BridgeCommand>,
+    update_events: SyncSender<UpdateEvent>,
+    automatic_updates: bool,
+) -> BackgroundTasks {
+    // The cached catalog serves until the fresh one arrives.
+    let catalog_refresh = tokio::spawn(host.refresh_game_catalog(service.clone()));
+    if let Err(error) = host.enable_autostart_once(service).await {
+        tracing::warn!(%error, "Could not turn on launch at login");
+    }
+    host.start_device_monitors(service);
+    // Hybrid mode: restores the stored settings when the web panel lets
+    // go of the mouse (does nothing with Hybrid mode off).
+    service.start_mode_monitor();
+
+    let snapshot_service = service.clone();
+    let snapshot_publisher = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            // Nobody listens in headless mode: stop building snapshots.
+            if let Err(mpsc::TrySendError::Disconnected(_)) =
+                snapshots.try_send(snapshot_service.snapshot().await)
+            {
+                return;
+            }
+        }
+    });
+
+    // Update work runs apart from the tray commands, one job at a time in
+    // the order asked, so a 10-minute download never holds up a setting.
+    let (update_jobs, queued_update_jobs) = tokio_mpsc::unbounded_channel();
+    let worker_events = update_events.clone();
+    let worker_host = host.clone();
+    let update_worker = tokio::spawn(run_serially(queued_update_jobs, move |job| {
+        worker_host.run_update_job(job, worker_events.clone())
+    }));
+
+    let timer_service = service.clone();
+    let timer_jobs = update_jobs.clone();
+    let timer_host = host.clone();
+    let update_timer = tokio::spawn(async move {
+        if timer_host.is_stub_install() {
+            return;
+        }
+        loop {
+            tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+            if timer_service.snapshot().await.automatic_updates {
+                let _ = timer_jobs.send(UpdateJob::Check {
+                    install_automatically: true,
+                });
+            }
+        }
+    });
+
+    let command_service = service.clone();
+    let command_handler = tokio::spawn(async move {
+        // An update helper that failed left a note for this launch.
+        if let Some(error) = host.take_last_update_failure() {
+            tracing::warn!(%error, "the last Bridge update did not install");
+            let _ = update_events.try_send(UpdateEvent::Failed(error));
+        }
+        // A stub install can't run its HID helper yet; finishing it comes
+        // before any ordinary update check.
+        if host.is_stub_install() {
+            tokio::spawn(host.finish_stub_install(update_events.clone()));
+        } else if automatic_updates {
+            let _ = update_jobs.send(UpdateJob::Check {
+                install_automatically: true,
+            });
+        }
+        while let Some(command) = commands.recv().await {
+            match command {
+                BridgeCommand::SetBatteryThreshold(percent) => {
+                    if let Err(error) = command_service.set_battery_threshold(percent).await {
+                        tracing::error!(%error, "could not save Bridge settings");
+                    }
+                }
+                BridgeCommand::SetNotificationSound(enabled) => {
+                    if let Err(error) = command_service.set_notification_sound(enabled).await {
+                        tracing::error!(%error, "could not save Bridge settings");
+                    }
+                }
+                BridgeCommand::SetNotificationVolume(percent) => {
+                    if let Err(error) = command_service.set_notification_volume(percent).await {
+                        tracing::error!(%error, "could not save Bridge settings");
+                    }
+                }
+                BridgeCommand::SetAutomaticUpdates(enabled) => {
+                    match command_service.set_automatic_updates(enabled).await {
+                        Ok(()) if enabled => {
+                            let _ = update_jobs.send(UpdateJob::Check {
+                                install_automatically: true,
+                            });
+                        }
+                        Ok(()) => {}
+                        Err(error) => {
+                            tracing::error!(%error, "could not save Bridge settings");
+                        }
+                    }
+                }
+                BridgeCommand::SetHybridMode(enabled) => {
+                    if let Err(error) = command_service.set_hybrid_mode(enabled).await {
+                        tracing::error!(%error, "could not save Bridge settings");
+                    }
+                }
+                BridgeCommand::SetTrayBatteryStyle(style) => {
+                    if let Err(error) = command_service
+                        .set_tray_battery_style(style.as_config_str())
+                        .await
+                    {
+                        tracing::error!(%error, "could not save Bridge settings");
+                    }
+                }
+                BridgeCommand::CheckForUpdates => {
+                    let _ = update_jobs.send(UpdateJob::Check {
+                        install_automatically: false,
+                    });
+                }
+                BridgeCommand::InstallUpdate(update) => {
+                    let _ = update_jobs.send(UpdateJob::Install(update));
+                }
+                // Queued behind a download still running, as before, so
+                // it restarts into what that download stages.
+                BridgeCommand::ApplyUpdate => {
+                    let _ = update_jobs.send(UpdateJob::Apply);
+                }
+                BridgeCommand::ForgetBattery(device_id) => {
+                    command_service.forget_battery(&device_id).await;
+                }
+                BridgeCommand::AcknowledgeTrayHint => {
+                    if let Err(error) = command_service.acknowledge_tray_hint().await {
+                        tracing::error!(%error, "could not save Bridge settings");
+                    }
+                }
+                BridgeCommand::AcknowledgeWhatsNew => {
+                    if let Err(error) = command_service.acknowledge_whats_new().await {
+                        tracing::error!(%error, "could not save Bridge settings");
+                    }
+                }
+            }
+        }
+    });
+
+    BackgroundTasks {
+        catalog_refresh,
+        snapshot_publisher,
+        update_timer,
+        command_handler,
+        update_worker,
+    }
 }
 
 /// Update work the tray asks for, run one at a time by [`run_update_job`].
@@ -866,5 +980,147 @@ mod tests {
             next_relaunch_generation(MAX_QUICK_RELAUNCHES, Duration::from_secs(1), true),
             None
         );
+    }
+
+    /// A [`Host`] with no network, HID, process list or files. Its update
+    /// jobs report that they started and then never finish, like a download
+    /// that takes its time.
+    #[derive(Clone)]
+    struct FakeHost {
+        update_jobs_started: tokio_mpsc::UnboundedSender<()>,
+    }
+
+    impl Host for FakeHost {
+        fn refresh_game_catalog(
+            &self,
+            _: BridgeService,
+        ) -> impl Future<Output = ()> + Send + use<> {
+            async {}
+        }
+
+        async fn enable_autostart_once(&self, _: &BridgeService) -> Result<()> {
+            Ok(())
+        }
+
+        fn start_device_monitors(&self, _: &BridgeService) {}
+
+        fn is_stub_install(&self) -> bool {
+            false
+        }
+
+        fn take_last_update_failure(&self) -> Option<String> {
+            None
+        }
+
+        fn finish_stub_install(
+            &self,
+            _: SyncSender<UpdateEvent>,
+        ) -> impl Future<Output = ()> + Send + use<> {
+            async {}
+        }
+
+        fn run_update_job(
+            &self,
+            _: UpdateJob,
+            _: SyncSender<UpdateEvent>,
+        ) -> impl Future<Output = ()> + Send + use<> {
+            let started = self.update_jobs_started.clone();
+            async move {
+                let _ = started.send(());
+                std::future::pending::<()>().await
+            }
+        }
+    }
+
+    /// [`start_background`] over a service whose config lives in a fresh
+    /// temp directory, with the ends of its channels the tray would hold.
+    struct Wired {
+        service: BridgeService,
+        tasks: BackgroundTasks,
+        commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
+        update_jobs_started: tokio_mpsc::UnboundedReceiver<()>,
+        _snapshots: Receiver<BridgeSnapshot>,
+        _updates: Receiver<UpdateEvent>,
+    }
+
+    async fn wire() -> Wired {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = env::temp_dir().join(format!(
+            "openmouse-runtime-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        // Hybrid mode off, so the mode monitor never restores anything to a
+        // real mouse.
+        let bridge_config = config::BridgeConfig {
+            automatic_updates: false,
+            hybrid_mode: false,
+            ..Default::default()
+        };
+        let service = BridgeService::new(bridge_config, directory.join("config.json"));
+        let (snapshot_tx, snapshots) = mpsc::sync_channel(1);
+        let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
+        let (update_tx, updates) = mpsc::sync_channel(8);
+        let (started_tx, update_jobs_started) = tokio_mpsc::unbounded_channel();
+        let host = FakeHost {
+            update_jobs_started: started_tx,
+        };
+        let tasks =
+            start_background(&service, host, snapshot_tx, command_rx, update_tx, false).await;
+        Wired {
+            service,
+            tasks,
+            commands: command_tx,
+            update_jobs_started,
+            _snapshots: snapshots,
+            _updates: updates,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_server_starts_the_mode_monitor() {
+        let wired = wire().await;
+        assert_eq!(wired.service.snapshot().await.device_mode, "onboard");
+
+        wired.service.record_client_heartbeat().await;
+
+        // The mode monitor ticks every second; without it the mode never
+        // leaves onboard and Hybrid mode does nothing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while wired.service.snapshot().await.device_mode != "live" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the mode did not follow the panel connecting"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        wired.tasks.abort();
+    }
+
+    #[tokio::test]
+    async fn a_setting_lands_while_an_update_job_is_still_running() {
+        let mut wired = wire().await;
+        wired.commands.send(BridgeCommand::CheckForUpdates).unwrap();
+        wired
+            .commands
+            .send(BridgeCommand::SetBatteryThreshold(42))
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), wired.update_jobs_started.recv())
+            .await
+            .expect("the update check never started")
+            .unwrap();
+        // The check never finishes; the setting after it still has to land.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while wired.service.config().await.battery_threshold_percent != 42 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tray command waited on the update job"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        wired.tasks.abort();
     }
 }
