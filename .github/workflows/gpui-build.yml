@@ -14,15 +14,9 @@ concurrency:
   group: gpui-build-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Keep in sync with ci.yml and release.yml.
-  NATIVE_HID_NODE_VERSION: v24.18.1
-  # Bump together with NATIVE_HID_NODE_VERSION: the SHA-256 of each archive
-  # below, from https://nodejs.org/dist/<version>/SHASUMS256.txt.
-  NATIVE_HID_NODE_SHA256_DARWIN_ARM64: eb02f7fab96d3d67de40c5ec8566096fcb4c2026728787683ae5a97eb612b941
-  NATIVE_HID_NODE_SHA256_DARWIN_X64: 6fb20fceacbb157c2f95825b80df4a454a0f6d81cdcd7bb81eeae9147e0e76ec
-  NATIVE_HID_NODE_SHA256_LINUX_X64: d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0
-  NATIVE_HID_NODE_SHA256_WIN_X64: ec56b84a7551893ab2324ebdfdc4ab974a63b4781162600b68a1293cc3e53765
+# NATIVE_HID_NODE_VERSION and the NATIVE_HID_NODE_SHA256_* archive pins come
+# from .github/scripts/native-hid-node.mjs (the "Read the pinned Node.js
+# runtime" step in each job).
 
 jobs:
   macos-dmg:
@@ -48,9 +42,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: gpui-macos
+      - name: Read the pinned Node.js runtime
+        id: native-hid-node
+        run: node .github/scripts/native-hid-node.mjs
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 24
+          node-version: ${{ steps.native-hid-node.outputs.version }}
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -196,9 +193,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: gpui-linux
+      - name: Read the pinned Node.js runtime
+        id: native-hid-node
+        run: node .github/scripts/native-hid-node.mjs
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 24
+          node-version: ${{ steps.native-hid-node.outputs.version }}
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -307,9 +307,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: gpui-windows
+      - name: Read the pinned Node.js runtime
+        id: native-hid-node
+        run: node .github/scripts/native-hid-node.mjs
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 24
+          node-version: ${{ steps.native-hid-node.outputs.version }}
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5

@@ -13,10 +13,6 @@ concurrency:
   group: bridge-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  # Keep in sync with release.yml's NATIVE_HID_NODE_VERSION.
-  NATIVE_HID_NODE_VERSION: v24.18.1
-
 jobs:
   check:
     name: Check (${{ matrix.os }})
@@ -47,9 +43,12 @@ jobs:
         run: cargo test --locked
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Read the pinned Node.js runtime
+        id: native-hid-node
+        run: node .github/scripts/native-hid-node.mjs
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 24
+          node-version: ${{ steps.native-hid-node.outputs.version }}
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
