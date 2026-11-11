@@ -46,4 +46,25 @@
 - Unverified: anything on hardware (Hybrid restore, X11 kept connection, HID spawn_blocking), workflows on a runner, MSVC/macOS.
 - Helper E risk [Inference]: a slow HID command (>~64 ms) still blocks input reads and can overflow the queue (#10 territory).
 
-NEXT: Victor pushes main (ahead of dd49d0f). Open: #10 and #15 (his call), N4-N8, N10-N12 (his calls), N1 activation (key) when he wants.
+## 2026-11-11 Update (P9-OMB15..17, hand-off)
+- Main 62c9471 (local, ahead of origin 00a0eea): merged #15a t3/run-server-wiring and #15b t3/native-hid-tests.
+  Checks: fmt ok, cargo test 286+43+11, clippy clean Linux + windows-gnu, scripts 16/16, native-hid npm test 19 pass
+  (2 baseline fails, node-hid not installed; bare `node --test` also picks up test-delux-hardware.mjs, ignore).
+- P9-OMB17 (Victor approved, wants a real-mouse test): branch t3/hid-reads (pushed to origin, NOT merged), commits
+  d5e6680 (#10 Linux blocking reader), 80df688 (reopened reader handle must match vendor/product/serial/interface/descriptor,
+  FIDO refused; security-review finding), 57cdfce (input reports keep flowing during slow commands). 293+41+11 pass.
+  Risk: identity check could wrongly refuse a real device, most likely on Windows (Listen fails "HID interface changed").
+- Windows exe cannot be built on the box (GPUI needs fxc.exe). GitHub Actions now enabled on the fork; run 43031950095
+  cancelled at Victor's word ("takeover from github actions"). Building on E-Daddy instead: PC child
+  <t3-thread://v2/032c749a-9cf5-42d3-a0e2-7beecea76516/mcp:launch:e6ddcd3a46957391f03e25745d2d4a55d30656656cfeee55c9ef5c8bcb159ac1>
+  in C:\Users\Victo\OpenMouse-Bridge (detached at 57cdfce, switches back after), exe to Desktop\openmouse-bridge-hid-test.exe,
+  report Desktop\omb-build-report.txt. E-Daddy: Rust 1.90 + rustup (Ascendara, 05:44 PT), VS Build Tools just installed by Victor.
+- Test plan for Victor (Windows): run the Desktop exe, open control.openmouse.app, Listen: live input (buttons, DPI, battery),
+  Unlisten/close fast, a long settings write while moving the mouse fast must not disconnect. Linux part of #10 needs a Linux
+  box with a mouse + browser (the ZimaOS container has no HID devices); not planned.
+- Disk cleanup done (workspace CHANGELOG): 30G -> 96G free. omb-target and omb-target-win kept.
+
+NEXT: read the E-Daddy build child (link above). If green: give Victor the test steps (DO THIS format). If his test passes,
+merge t3/hid-reads --no-ff into main, run temp/omb-checks.sh, FORK-CHANGELOG line, tasks.js done P9-OMB17 with evidence,
+Victor pushes main (docker exec line in STATE above). If Listen fails with "interface changed", relax/fix the identity check.
+Open (his calls): N4-N8, N10-N12, N1 activation. Skills: none required (delegation-board for helpers).
