@@ -97,3 +97,13 @@ t3/<topic>, review, merge, E-Daddy 2nd build (env 032c749a-..., C:\Users\Victo\O
 
 NEXT: after the update, relaunch the Fable 5.2 consult (delegate_task claudeHub claude-fable-5-2, effort high) -> reports/upstream-pr-plan.md,
 relaunch 3 helpers (device-support resumes in its worktree; first-scan; fork-update-feed), review, merge, E-Daddy 2nd build, then P9-OMB19.
+- 2026-11-12 00:45 UTC: Fable 5.2 failed again (T3 server from Nov 11 still spawns children as 2.1.280). Victor: "Restart now".
+  Helpers stopped mid-work, uncommitted work kept in worktrees (all based on local main):
+  .claude/worktrees/agent-ada5c67229b726f70 (device-support: PR60 reapplied on main hid.rs, checks pending),
+  .claude/worktrees/agent-a2be35f5c2508a6ab (first-scan: fix + test in progress),
+  .claude/worktrees/agent-a9880f05cf9833157 (fork-update-feed: code done, tests pending).
+  Security: ttyd :8080 login is visible in `ps` and leaked into this transcript; task P9-SEC-TTYD (Victor).
+
+NEXT: after t3 serve restart, check claude version of T3 children, relaunch Fable 5.2 consult (delegate_task claudeHub
+claude-fable-5-2 effort high, same brief) -> reports/upstream-pr-plan.md; relaunch 3 helpers each told to continue in its
+existing worktree above (cd there, checkout -B t3/<topic>, finish, commit, checks). Then review, merge, E-Daddy build, P9-OMB19.
