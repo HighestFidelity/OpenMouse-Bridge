@@ -1222,11 +1222,18 @@ async fn signed_feeds_are_checked_end_to_end() {
 
     // No key built in: unsigned feeds work as before.
     let unsigned = serve_feed(FEED, None).await;
-    assert_eq!(fetch_feed(&unsigned, None).await.unwrap().version, "9.9.9");
+    assert_eq!(
+        fetch_feed(&unsigned, None).await.unwrap().unwrap().version,
+        "9.9.9"
+    );
     // Key built in: a good signature passes; missing or forged ones refuse.
     let signed = serve_feed(FEED, Some(good)).await;
     assert_eq!(
-        fetch_feed(&signed, Some(key)).await.unwrap().version,
+        fetch_feed(&signed, Some(key))
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
         "9.9.9"
     );
     let error = fetch_feed(&unsigned, Some(key)).await.unwrap_err();
@@ -1234,4 +1241,39 @@ async fn signed_feeds_are_checked_end_to_end() {
     let forged = serve_feed(FEED, Some(forged)).await;
     let error = fetch_feed(&forged, Some(key)).await.unwrap_err();
     assert!(format!("{error:#}").contains("does not match"), "{error:#}");
+}
+
+#[tokio::test]
+async fn a_repo_without_releases_offers_no_update() {
+    use axum::{Router, http::StatusCode, routing::get};
+    // GitHub answers 404 for `releases/latest/download/latest.json` until the
+    // repo has a release: that is "no update", not a failed check.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new().route("/broken.json", get(|| async { StatusCode::BAD_GATEWAY }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let missing = format!("http://{address}/latest.json");
+    assert!(fetch_feed(&missing, None).await.unwrap().is_none());
+    // Even with a signing key: nothing is downloaded, so nothing to verify.
+    assert!(fetch_feed(&missing, Some([7; 32])).await.unwrap().is_none());
+    // Other HTTP errors still fail the check.
+    let broken = format!("http://{address}/broken.json");
+    assert!(fetch_feed(&broken, None).await.is_err());
+}
+
+#[test]
+fn updates_come_from_the_fork_releases() {
+    const REPO: &str = "HighestFidelity/OpenMouse-Bridge";
+    assert_eq!(
+        LATEST_RELEASE_URL,
+        format!("https://api.github.com/repos/{REPO}/releases/latest")
+    );
+    assert_eq!(
+        feed::LATEST_JSON_URL,
+        format!("https://github.com/{REPO}/releases/latest/download/latest.json")
+    );
+    assert_eq!(
+        feed::RELEASES_PAGE,
+        format!("https://github.com/{REPO}/releases/latest")
+    );
 }
