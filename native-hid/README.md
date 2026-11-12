@@ -48,6 +48,13 @@ fall through to the generic `AttackSharkHidClient` path, which drives the 0x04
 six-stage table for model `0x55` (mouse-protocol #174), preserving the stages
 the request does not touch.
 
+A brand entry can also narrow which interfaces are opened: `productIds` keeps
+only its own products on a shared vendor id, and `usagePage` opens only an
+interface's collections on that page. The Scyrox entry uses both: CompX's
+vendor id `0x3554` carries several brands, and the Scyrox V8's dongle stops
+answering on its `0xff02` config collection on Windows while its sibling
+vendor collections are open and read.
+
 ## Button listener
 
 `button-listener.mjs` is the one long-running helper. While a game's profile assigns
@@ -110,9 +117,15 @@ runtime first and falls back to `node` on `PATH`, so local development
   model `0x55`); the reporter in mouse-protocol #161 confirmed DPI and
   polling controls working after that fix, with a read-back write round-trip
   still to be captured.
+- Scyrox V8 reads were hardware-verified on Windows through its 8K dongle
+  (`0x3554:0xf5f7`): a `HidDeviceAdapter` on the `0xff02` collection alone
+  read 1,600 DPI and 2,000 Hz, while one on every interface-1 collection got
+  no answer. The full `apply.mjs` path still needs a run on that mouse
+  (`@openmouse/protocol` v0.58.0 already lists the V8 in its Scyrox catalog).
 - Other adapter and dispatch paths are structurally tested (module resolution,
   exit codes and control flow) and still require validation on their respective
   hardware.
-- G-Wolves is deliberately left out of `brands.mjs`: it isn't a finished,
-  exported driver in `mouse-protocol` yet (untracked source, no
-  `package.json` export, no `registry.ts` entry as of this writing).
+- G-Wolves DPI and polling were hardware-verified on Windows with the HTS
+  Ultra 8K wireless receiver (PID `0x5317`, XVI protocol): each value was
+  written, then read back from the mouse. The wired PIDs and the `xvi-new`
+  and `gwolves` protocol classes have not been tried on hardware.

@@ -55,6 +55,8 @@ export class HidDeviceAdapter {
     this._Handle = Handle;
     this._devices = [];
     this._listeners = new Set();
+    // Frame length last sent per feature report id (see receiveFeatureReport).
+    this._featureLengths = new Map();
     this._onData = this._onData.bind(this);
     this._onError = this._onError.bind(this);
   }
@@ -108,6 +110,7 @@ export class HidDeviceAdapter {
       device.close();
     }
     this._devices = [];
+    this._featureLengths.clear();
     this.opened = false;
   }
 
@@ -150,6 +153,7 @@ export class HidDeviceAdapter {
       }
     }
     if (!sent) throw lastError ?? new Error("No HID interface accepted the feature report.");
+    this._featureLengths.set(reportId, frame.length);
   }
 
   /**
@@ -158,7 +162,11 @@ export class HidDeviceAdapter {
    * from the parsed report descriptor. Drivers here call this with the
    * length they themselves expect back baked into their own retry/parsing
    * logic, so a generous fixed buffer (the largest report any known driver
-   * here uses) is safe — short replies are simply the leading bytes of it.
+   * here uses) is safe on most firmware — short replies are simply the
+   * leading bytes of it. Some firmware stalls a request longer than its
+   * report instead (the wired G-Wolves HTS Ultra, 0x33e4:0x5308, fails 91
+   * bytes and answers 65), so a report id the driver sent on this handle is
+   * asked again at the length it was sent at when the generous read fails.
    *
    * Classic Razer's control protocol is the largest: 90-byte feature reports
    * on report id 0 (mouse-protocol/src/razer/codec.ts, RAZER_PACKET_LENGTH =
@@ -178,19 +186,24 @@ export class HidDeviceAdapter {
    */
   async receiveFeatureReport(reportId) {
     this._requireOpen();
-    // Largest driver payload (Razer's 90-byte feature report) + the id byte.
-    const requestedLen = 91;
+    // Largest driver payload (Razer's 90-byte feature report) + the id byte,
+    // then the length this id was sent at.
+    const generousLen = 91;
+    const sentLen = this._featureLengths.get(reportId);
+    const lengths = sentLen && sentLen < generousLen ? [generousLen, sentLen] : [generousLen];
     let lastError;
-    for (const device of this._devices) {
-      try {
-        // node-hid's sync HID.getFeatureReport returns a number[] (its
-        // HIDAsync variant returns a Buffer), so normalize to Uint8Array
-        // before slicing.
-        const raw = Uint8Array.from(device.getFeatureReport(reportId, requestedLen));
-        const payload = raw.length > 1 && raw[0] === reportId ? raw.subarray(1) : raw;
-        return new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
-      } catch (error) {
-        lastError = error;
+    for (const requestedLen of lengths) {
+      for (const device of this._devices) {
+        try {
+          // node-hid's sync HID.getFeatureReport returns a number[] (its
+          // HIDAsync variant returns a Buffer), so normalize to Uint8Array
+          // before slicing.
+          const raw = Uint8Array.from(device.getFeatureReport(reportId, requestedLen));
+          const payload = raw.length > 1 && raw[0] === reportId ? raw.subarray(1) : raw;
+          return new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+        } catch (error) {
+          lastError = error;
+        }
       }
     }
     throw lastError ?? new Error("No HID interface answered the feature report request.");
@@ -249,13 +262,27 @@ export class HidDeviceAdapter {
  * HidDeviceAdapter per interface, merging any node-hid entries that split
  * off the same interface into separate top-level collections (see module
  * docs above).
+ *
+ * A brand entry can narrow the list (see brands.mjs): `productIds` drops
+ * other products sharing the vendor id, and `usagePage` keeps only the
+ * interface's collections on that page. Opening a collection starts a reader
+ * on it, and some receivers stop answering on their config collection while
+ * a sibling collection is read: the Scyrox V8's dongle (0x3554:0xf5f7)
+ * answered 0 of 5 battery queries with all seven of its interface-1
+ * collections open on Windows, and 5 of 5 with only 0xff02 read. Where the
+ * platform lists one entry per interface instead (hidraw on Linux), the
+ * entry has no usage page to match and the interface is kept whole.
  * @param {number} vendorId
+ * @param {{ productIds?: readonly number[], usagePage?: number }} [hints]
+ * @param {() => import("node-hid").Device[]} [list]
  * @returns {HidDeviceAdapter[]}
  */
-export function candidateDevices(vendorId) {
+export function candidateDevices(vendorId, hints = {}, list = devices) {
+  const { productIds, usagePage } = hints;
   const groups = new Map();
-  for (const info of devices()) {
+  for (const info of list()) {
     if (info.vendorId !== vendorId) continue;
+    if (productIds && !productIds.includes(info.productId)) continue;
     // Skip keyboard collections (macOS denies IOHIDDeviceOpen with privilege violation 0xE00002C1)
     if (info.usagePage === 1 && info.usage === 6) continue;
     // Skip standard boot mouse collections (exclusive system cursor access 0xE00002C5, no vendor feature reports)
@@ -265,7 +292,9 @@ export function candidateDevices(vendorId) {
     if (group) group.push(info);
     else groups.set(key, [info]);
   }
-  return [...groups.values()].map((infos) => {
+  return [...groups.values()].map((group) => {
+    const onPage = usagePage === undefined ? [] : group.filter((info) => info.usagePage === usagePage);
+    const infos = onPage.length > 0 ? onPage : group;
     // Several node-hid entries for one interface commonly share the same
     // underlying `path` (one physical device, listed once per top-level
     // collection its descriptor declares) — open each distinct path once.

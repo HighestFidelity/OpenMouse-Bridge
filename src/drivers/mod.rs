@@ -70,7 +70,28 @@ const KNOWN_BRANDS: &[(&str, &[u16])] = &[
     ("Wooting", &[0x31e3]),
     ("Microsoft", &[0x045e]),
     ("WALLHACK", &[0x3879, 0x1caa]),
+    ("G-Wolves", &[0x33e4]),
 ];
+
+/// Brands claimed by exact (vendor id, product ids) rather than by vendor id,
+/// because their mice ride other makers' ids: Redragon's Holtek 0x04d9
+/// (M724 K1NG 1K, M612 Predator; `mouse-protocol`'s `REDRAGON_PRODUCT_IDS`)
+/// carries many other makers' keyboards, and SinoWealth 0x258a (M690 PRO
+/// cable and receiver; `REDRAGON_M690_PRO_PRODUCT_IDS`) Glorious's classic
+/// line. Checked before `KNOWN_BRANDS`. Mirrors the redragon entry in
+/// `native-hid/src/brands.mjs`.
+const KNOWN_PRODUCTS: &[(&str, u16, &[u16])] = &[
+    ("Redragon", 0x04d9, &[0xfc7a, 0xfc61]),
+    ("Redragon", 0x258a, &[0x002e, 0x002f]),
+];
+
+/// The brand `KNOWN_PRODUCTS` gives this exact product, if any.
+fn product_brand(vendor_id: u16, product_id: u16) -> Option<&'static str> {
+    KNOWN_PRODUCTS
+        .iter()
+        .find(|(_, vendor, products)| *vendor == vendor_id && products.contains(&product_id))
+        .map(|(brand, _, _)| *brand)
+}
 
 /// The brand a model name starts with ("Attack Shark R5 Ultra" is Attack
 /// Shark's), for mice that vendor-id discovery labels with another brand.
@@ -79,6 +100,7 @@ pub fn brand_in_name(name: &str) -> Option<&'static str> {
     KNOWN_BRANDS
         .iter()
         .map(|(brand, _)| *brand)
+        .chain(KNOWN_PRODUCTS.iter().map(|(brand, _, _)| *brand))
         .filter(|brand| {
             name.strip_prefix(&brand.to_ascii_lowercase())
                 .is_some_and(|rest| rest.starts_with(' '))
@@ -96,6 +118,27 @@ const LOGITECH_VENDOR_ID: u16 = 0x046d;
 const HIDPP_USAGE_PAGE: u16 = 0xff00;
 const HIDPP_BLUETOOTH_USAGE_PAGE: u16 = 0xff43;
 
+/// CompX's vendor id, shared by several brands' report-8 hardware.
+const COMPX_VENDOR_ID: u16 = 0x3554;
+
+/// Scyrox's products on CompX's vendor id (`mouse-protocol`'s
+/// `SCYROX_PRODUCT_IDS`): the V8S wired and on its Turbo 8k dongle, and the
+/// V8's 8K dongle.
+const SCYROX_PRODUCT_IDS: &[u16] = &[0xf515, 0xf517, 0xf5f7];
+
+/// The brand of a product on CompX's vendor id. Teevolution, VGN and Scyrox
+/// share it with disjoint product ids (pulsar-hid.ts's
+/// CLAIMED_VGN_PRODUCT_IDS); Noir Gear's 0xf500 rides it too but has no
+/// native driver.
+fn compx_brand(product_id: u16) -> Option<&'static str> {
+    match product_id {
+        0xfb56 | 0xfb57 => Some("VGN"),
+        id if SCYROX_PRODUCT_IDS.contains(&id) => Some("Scyrox"),
+        0xf500 => None,
+        _ => Some("Teevolution"),
+    }
+}
+
 /// The brand a discovered HID interface belongs to, or `None` when the
 /// interface should be skipped (other vendors' hardware, Logitech non-HID++
 /// interfaces, Noir's undriven receiver PID).
@@ -111,15 +154,11 @@ fn discovered_brand(info: &hidapi::DeviceInfo) -> Option<&'static str> {
             || usage_page == HIDPP_BLUETOOTH_USAGE_PAGE;
         return hidpp_transport.then_some("Logitech");
     }
-    if vendor_id == 0x3554 {
-        // Teevolution and VGN share this vendor page; their product ids are
-        // disjoint (pulsar-hid.ts's CLAIMED_VGN_PRODUCT_IDS). Noir Gear's
-        // 0xf500 rides it too but has no native driver.
-        return match info.product_id() {
-            0xfb56 | 0xfb57 => Some("VGN"),
-            0xf500 => None,
-            _ => Some("Teevolution"),
-        };
+    if vendor_id == COMPX_VENDOR_ID {
+        return compx_brand(info.product_id());
+    }
+    if let Some(brand) = product_brand(vendor_id, info.product_id()) {
+        return Some(brand);
     }
     KNOWN_BRANDS
         .iter()
@@ -803,12 +842,13 @@ mod tests {
             "parsed no vendor ids — did brands.mjs's format change?"
         );
         let discoverable = |id: u16| {
-            // The special-cased vendor ids in `discovered_brand`: the shared
-            // Teevolution/VGN page, Logitech's HID++ transport, and Pulsar's
-            // own Rust-driver vendor id.
-            [pulsar::VENDOR_ID, 0x3554, LOGITECH_VENDOR_ID].contains(&id)
+            // The special-cased vendor ids in `discovered_brand`: CompX's
+            // shared page, Logitech's HID++ transport, and Pulsar's own
+            // Rust-driver vendor id.
+            [pulsar::VENDOR_ID, COMPX_VENDOR_ID, LOGITECH_VENDOR_ID].contains(&id)
                 || delux::SUPPORTED_VENDOR_IDS.contains(&id)
                 || KNOWN_BRANDS.iter().any(|(_, ids)| ids.contains(&id))
+                || KNOWN_PRODUCTS.iter().any(|(_, vendor, _)| *vendor == id)
         };
         for id in helper_vendor_ids {
             assert!(
@@ -816,13 +856,52 @@ mod tests {
                 "vendor id 0x{id:04x} is in brands.mjs but discovery cannot see it"
             );
         }
-        for (brand, _) in KNOWN_BRANDS {
+        let compx_brands = [0xf520, 0xfb56, 0xf5f7].map(|id| compx_brand(id).unwrap());
+        for brand in KNOWN_BRANDS
+            .iter()
+            .map(|(brand, _)| *brand)
+            .chain(compx_brands)
+            .chain(KNOWN_PRODUCTS.iter().map(|(brand, _, _)| *brand))
+        {
             let key = brand.trim().to_lowercase();
             assert!(
                 helper_keys.contains(&key),
                 "discovery brand {brand:?} has no {key:?} key in brands.mjs"
             );
         }
+    }
+
+    #[test]
+    fn compx_products_go_to_their_own_brand() {
+        // Teevolution Terra Pro, VGN Dragonfly F2 Master+, Noir Gear M1-NEX.
+        assert_eq!(compx_brand(0xf520), Some("Teevolution"));
+        assert_eq!(compx_brand(0xfb57), Some("VGN"));
+        assert_eq!(compx_brand(0xf500), None);
+        // Scyrox V8S wired, its Turbo 8k dongle and the V8's 8K dongle, which
+        // the Teevolution client cannot drive.
+        for id in [0xf515, 0xf517, 0xf5f7] {
+            assert_eq!(compx_brand(id), Some("Scyrox"));
+        }
+    }
+
+    #[test]
+    fn redragon_is_claimed_only_by_its_known_products() {
+        // M724 K1NG 1K and M612 Predator on Holtek, M690 PRO cable and
+        // receiver on SinoWealth.
+        for id in [0xfc7a, 0xfc61] {
+            assert_eq!(product_brand(0x04d9, id), Some("Redragon"));
+        }
+        for id in [0x002e, 0x002f] {
+            assert_eq!(product_brand(0x258a, id), Some("Redragon"));
+        }
+        // Other products on those vendor ids (a Holtek keyboard, Glorious's
+        // classic Model O) and a known product id on the wrong vendor.
+        assert_eq!(product_brand(0x04d9, 0x0006), None);
+        assert_eq!(product_brand(0x258a, 0x0036), None);
+        assert_eq!(product_brand(0x258a, 0xfc7a), None);
+        // Attack Shark keeps 0x25a7; the M719RGB-PRO is not claimed.
+        assert_eq!(product_brand(0x25a7, 0xfa7e), None);
+        assert_eq!(brand_in_name("Redragon M690 PRO"), Some("Redragon"));
     }
 
     #[test]

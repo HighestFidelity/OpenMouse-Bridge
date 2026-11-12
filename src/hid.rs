@@ -35,6 +35,11 @@ const RAZER_VENDOR_ID: u16 = 0x1532;
 /// to a security key through Bridge.
 const FIDO_USAGE_PAGE: u16 = 0xF1D0;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
+const THERMALTAKE_VENDOR_ID: u16 = 0x264A;
+/// The Iris's config collection holds only constant items, so Windows gives it
+/// no caps and hidapi's rebuilt descriptor declares none of its 2052-byte
+/// feature reports. Reads use this buffer (report id plus 2052 bytes) instead.
+const THERMALTAKE_FEATURE_BUFFER_LEN: usize = 2053;
 const RESUME_WATCH_STEP: Duration = Duration::from_secs(2);
 /// A step that overshoots by this much means the machine was suspended.
 const RESUME_GAP_THRESHOLD: Duration = Duration::from_secs(15);
@@ -1176,9 +1181,10 @@ impl HidSession {
         for path in &open.paths {
             let buffer_len = match path.layout.feature_buffer_len(report_id) {
                 Ok(length) => length,
-                Err(_) if open.vendor_id == RAZER_VENDOR_ID => RAZER_FEATURE_BUFFER_LEN,
-                Err(_) if open.vendor_id == MICROSOFT_VENDOR_ID => 64,
-                Err(_) => continue,
+                Err(_) => match undeclared_feature_buffer_len(open.vendor_id) {
+                    Some(length) => length,
+                    None => continue,
+                },
             };
             available = true;
             let mut data = vec![0; buffer_len];
@@ -1215,6 +1221,18 @@ impl HidSession {
             "could not receive feature report {report_id}: {}",
             last_error.unwrap_or_else(|| "no HID path was open".to_owned())
         ))
+    }
+}
+
+/// The read buffer for a feature report the interface's descriptor does not
+/// declare, for vendors whose devices answer such reads anyway. `None` means
+/// the read is refused as undeclared.
+fn undeclared_feature_buffer_len(vendor_id: u16) -> Option<usize> {
+    match vendor_id {
+        RAZER_VENDOR_ID => Some(RAZER_FEATURE_BUFFER_LEN),
+        MICROSOFT_VENDOR_ID => Some(64),
+        THERMALTAKE_VENDOR_ID => Some(THERMALTAKE_FEATURE_BUFFER_LEN),
+        _ => None,
     }
 }
 
@@ -2594,6 +2612,19 @@ mod tests {
         for thread in threads {
             thread.join().expect("enumeration thread");
         }
+    }
+
+    #[test]
+    fn undeclared_feature_reads_fall_back_only_for_known_vendors() {
+        assert_eq!(
+            undeclared_feature_buffer_len(RAZER_VENDOR_ID),
+            Some(RAZER_FEATURE_BUFFER_LEN)
+        );
+        assert_eq!(undeclared_feature_buffer_len(MICROSOFT_VENDOR_ID), Some(64));
+        // Tt eSPORTS Iris: report id plus 2052 bytes.
+        assert_eq!(undeclared_feature_buffer_len(0x264A), Some(2053));
+        assert_eq!(undeclared_feature_buffer_len(0x046D), None);
+        assert_eq!(undeclared_feature_buffer_len(0x3554), None);
     }
 
     #[test]
