@@ -79,3 +79,12 @@ AskUserQuestion which to adopt, worktree fixes, merge, E-Daddy 2nd build.
 Cleanup (needs Victor's yes, AskUserQuestion): 5 leftover worktrees (agent-a299cd on t3/hid-reads, agent-a5fdabd, agent-aadafcd,
 agent-aff6c11, openmouse-bridge-wt/app-hardening; the 3 non-hid are merged, hid-reads after its merge) + workspace/temp/omb17-* scratch.
 Open (his calls): N4-N8, N10-N12, N1 activation. Skills: delegation-board for helpers.
+
+## 2026-11-12 Update (P9-OMB17 merged, P9-OMB18 started)
+- Main ce0c5ca: merged t3/hid-reads --no-ff. fmt ok, cargo test 293+43+11, clippy clean linux + windows-gnu, scripts 16/16.
+  P9-OMB17 done. Origin main still 506c0a3: Victor pushes.
+- Cleanup done (Victor's yes): 5 merged worktrees removed (branches kept), temp/omb17-* deleted.
+- P9-OMB18: triage subagent writing reports/upstream-triage.md (upstream open PRs + issues vs fork).
+
+NEXT: read reports/upstream-triage.md, brainstorm 2nd-build plan, AskUserQuestion which items to adopt, worktree fixes
+t3/<topic>, review, merge, E-Daddy 2nd build (env 032c749a-..., C:\Users\Victo\OpenMouse-Bridge, Git usr\bin + .cargo\bin on PATH).

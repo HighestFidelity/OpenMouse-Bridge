@@ -42,3 +42,9 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   Host seam; tests prove the mode monitor starts and tray settings land while an update job runs.
 - t3/native-hid-tests (P9-OMB16, idea #15b): 19 node tests for apply.mjs, button-listener.mjs and the HID
   adapter against a fake node-hid (npm test 19 pass; the 2 baseline failures need node-hid installed).
+
+## 2026-11-12
+- t3/hid-reads (P9-OMB17, #10) merged ce0c5ca: Linux input readers block on their own hidraw handle, the reopened
+  reader must match vendor/product/serial/interface/descriptor (FIDO refused), input reports keep flowing during
+  slow commands. Windows real-mouse test passed (Victor 2026-11-11 16:28 PT). Linux part not hardware-tested.
+- Cleanup (Victor's yes, APPROVALS 2026-11-12 16:29 PT): 5 merged worktrees removed, branches kept; temp/omb17-* deleted.
