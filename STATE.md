@@ -142,3 +142,15 @@ C:\Users\Victo\OpenMouse-Bridge, Git usr\bin + .cargo\bin on PATH) -> Victor tes
 NEXT: watch #106-#109 for maintainer review (answer comments with the leaving-pr-comments skill, fix on the same upstream/*
 branch, push via askpass). When they respond, send wave 2 from reports/upstream-pr-plan.md items 5-14. Ask Victor (AskUserQuestion)
 about the cleanup list above. Skills: delegation-board, leaving-pr-comments, secrets-hygiene.
+
+## 2026-11-12 Update (PR watch, cleanup, main-push guardrail)
+- #106-#109: open, no maintainer reply yet. CodeRabbit only: #107 "no actionable comments", the other 3 hit its free review limit.
+  Status script: workspace/temp/omb19-pr-status.py [PR numbers] (reads the T3 token file, prints state/reviews/comments/checks).
+- Cleanup (Victor: "do what you think is best and wont waste tokens"): removed the 4 merged/pushed worktrees and
+  temp/omb-target-{dev,scan,upd} (~26 GB). Kept temp/omb19-try and temp/omb-target-up for wave 2. Not asked about, untouched:
+  temp/omb-target-{15a,up-rel,win} (~14.6 GB).
+- git-guardrails (HQ commit c49f4bf, tests 56/56): agents may push main of this fork (origin or the fork URL); force/delete
+  and other repos stay blocked. Ledger lines added.
+
+NEXT: re-run omb19-pr-status.py for maintainer replies on #106-#109; answer with leaving-pr-comments, fix on the same
+upstream/* branch, push via askpass. When maintainers respond, send wave 2 (reports/upstream-pr-plan.md items 5-14).
