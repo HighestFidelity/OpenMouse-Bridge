@@ -18,6 +18,11 @@
 // driver's own `isSupported()`; class import paths use the package's
 // "./drivers/*" subpath export (mouse-protocol/package.json), which maps
 // straight onto its compiled dist/drivers/ layout.
+//
+// An entry may narrow what candidateDevices() opens for it: `productIds`
+// keeps only those products of its vendor ids, and `usagePage` keeps only an
+// interface's collections on that page, for receivers whose other
+// collections must stay closed (see the Scyrox entry).
 
 const client = (module, exportName) => ({ module, exportName });
 
@@ -44,6 +49,20 @@ export const BRAND_DRIVERS = {
   vgn: {
     vendorIds: [0x3554],
     classes: [client("@openmouse/protocol/drivers/vgn/hid", "VgnF2HidClient")],
+  },
+  // CompX's vendor id again. The Scyrox dongles answer report 8 only on their
+  // 0xff02 collection, and on Windows the V8's "SCYROX 8K Dongle" stops
+  // answering it while Bridge also listens on the interface's other vendor
+  // collections, so only that collection is opened.
+  scyrox: {
+    vendorIds: [0x3554],
+    // mouse-protocol's SCYROX_PRODUCT_IDS (src/scyrox/index.ts, v0.58.0),
+    // copied rather than imported so this file stays plain data that loads
+    // without the package (test-fakes/register.mjs imports it first). Keep in
+    // step with SCYROX_PRODUCT_IDS in src/drivers/mod.rs.
+    productIds: [0xf515, 0xf517, 0xf5f7],
+    usagePage: 0xff02,
+    classes: [client("@openmouse/protocol/drivers/scyrox/hid", "ScyroxHidClient")],
   },
   logitech: {
     vendorIds: [0x046d],
