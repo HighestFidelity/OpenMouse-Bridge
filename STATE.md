@@ -121,3 +121,6 @@ existing worktree above (cd there, checkout -B t3/<topic>, finish, commit, check
 
 NEXT: Victor pushes main -> E-Daddy PC child builds the 2nd exe (env 032c749a-..., project c89ec849-..., checkout
 C:\Users\Victo\OpenMouse-Bridge, Git usr\bin + .cargo\bin on PATH) -> Victor tests -> P9-OMB19 upstream PRs per the plan.
+- E-Daddy build2 GREEN on 8316e4d: fmt ok, tests 288+38+11, clippy ok, release 33.5s. Desktop\openmouse-bridge-build2.exe
+  30,962,688 B sha256 8DB79387...6C013E046. PC checkout restored to main 3d0146f (local main behind origin, not pulled).
+  Test steps sent to Victor. NEXT: his result -> P9-OMB18 done -> P9-OMB19 upstream PRs per reports/upstream-pr-plan.md.
