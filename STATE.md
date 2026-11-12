@@ -107,3 +107,8 @@ relaunch 3 helpers (device-support resumes in its worktree; first-scan; fork-upd
 NEXT: after t3 serve restart, check claude version of T3 children, relaunch Fable 5.2 consult (delegate_task claudeHub
 claude-fable-5-2 effort high, same brief) -> reports/upstream-pr-plan.md; relaunch 3 helpers each told to continue in its
 existing worktree above (cd there, checkout -B t3/<topic>, finish, commit, checks). Then review, merge, E-Daddy build, P9-OMB19.
+- Fable 5.2 also failed on the direct "Claude" provider (enabled, Victor's yes; backup workspace/backups/20261112-0045-t3-settings).
+  Cause: my 00:43 restart ran from inside a session, so t3 serve inherited ANTHROPIC_BASE_URL=cliproxyapi + CLAUDE_CODE_* vars;
+  direct children still hit the proxy, which reports 2.1.280 [Inference]. Fixed script: workspace/temp/t3-restart.sh strips them.
+  Plan: when the 3 helpers finish, `setsid nohup bash /home/claude/workspace/temp/t3-restart.sh 60 &`, then relaunch Fable 5.2
+  on providerInstanceId claudeAgent. Proxy update later: P9-CLIPROXY-VER.
