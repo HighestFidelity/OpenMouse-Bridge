@@ -64,7 +64,18 @@
   box with a mouse + browser (the ZimaOS container has no HID devices); not planned.
 - Disk cleanup done (workspace CHANGELOG): 30G -> 96G free. omb-target and omb-target-win kept.
 
-NEXT: read the E-Daddy build child (link above). If green: give Victor the test steps (DO THIS format). If his test passes,
-merge t3/hid-reads --no-ff into main, run temp/omb-checks.sh, FORK-CHANGELOG line, tasks.js done P9-OMB17 with evidence,
-Victor pushes main (docker exec line in STATE above). If Listen fails with "interface changed", relax/fix the identity check.
-Open (his calls): N4-N8, N10-N12, N1 activation. Skills: none required (delegation-board for helpers).
+- E-Daddy build GREEN on 57cdfce (14:09 UTC): fmt ok, tests 282+36+11 (one updater test needs `sh`: Git usr\bin on PATH), clippy ok,
+  release 3m35s. Exe Desktop\openmouse-bridge-hid-test.exe 29.5 MB sha256 F8EC3D97...69AA6. Test steps already sent to Victor.
+
+- Victor's Windows mouse test PASSED (2026-11-11 16:28 PT, "Works, all checks passed", ledgered). Origin main = 506c0a3 (pushed).
+- New ask P9-OMB18 (deps P9-OMB17): triage upstream OpenMouse-Project/OpenMouse-Bridge open PRs (6) + open issues (5, API count
+  2026-11-11) for a 2nd build: diagnose each vs our fork, brainstorm, plan in reports/upstream-triage.md, Victor picks features
+  (AskUserQuestion), fix in worktrees t3/<topic>, merge, then 2nd Windows exe via an E-Daddy PC child. Upstream read-only (no gh CLI;
+  public API via curl works). Victor asked to retire the old OpenMouse threads and continue in a fresh session.
+
+NEXT: merge t3/hid-reads --no-ff into main, run temp/omb-checks.sh, FORK-CHANGELOG line, tasks.js done P9-OMB17 with evidence,
+Victor pushes main (docker exec line above). Then P9-OMB18: subagent triage of upstream PRs/issues -> reports/upstream-triage.md,
+AskUserQuestion which to adopt, worktree fixes, merge, E-Daddy 2nd build.
+Cleanup (needs Victor's yes, AskUserQuestion): 5 leftover worktrees (agent-a299cd on t3/hid-reads, agent-a5fdabd, agent-aadafcd,
+agent-aff6c11, openmouse-bridge-wt/app-hardening; the 3 non-hid are merged, hid-reads after its merge) + workspace/temp/omb17-* scratch.
+Open (his calls): N4-N8, N10-N12, N1 activation. Skills: delegation-board for helpers.
