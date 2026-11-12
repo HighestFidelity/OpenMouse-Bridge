@@ -124,3 +124,21 @@ C:\Users\Victo\OpenMouse-Bridge, Git usr\bin + .cargo\bin on PATH) -> Victor tes
 - E-Daddy build2 GREEN on 8316e4d: fmt ok, tests 288+38+11, clippy ok, release 33.5s. Desktop\openmouse-bridge-build2.exe
   30,962,688 B sha256 8DB79387...6C013E046. PC checkout restored to main 3d0146f (local main behind origin, not pulled).
   Test steps sent to Victor. NEXT: his result -> P9-OMB18 done -> P9-OMB19 upstream PRs per reports/upstream-pr-plan.md.
+
+## 2026-11-12 Update (P9-OMB19 first wave opened, hand-off)
+- 2nd build: Victor's Windows test passed ("it works and auto starts to, works"); P9-OMB18 done.
+- Upstream first wave (Victor: first 4, low-key note that the rest follow after review; token via T3 secret prompt):
+  #106 fido-block e572a7f, #107 hidraw-owner 817b1a2, #108 dev-origins f711a38, #109 battery-bounds 2d26200
+  (https://github.com/OpenMouse-Project/OpenMouse-Bridge/pull/106..109). Branches upstream/* on origin, each one commit
+  on upstream main ee9b799, checks green. Bodies: reports/upstream-prs/*.md. Opener: workspace/temp/omb19-open-prs.py.
+- Token: T3 secret file /home/claude/.t3/userdata/secrets/files/f68ebe0a8bfef15e08e48fc36803ca2b (workspace/.secrets writes
+  are denied); push via tools/omb-askpass.sh (OMB_TOKEN_FILE=<that file> GIT_ASKPASS=... git -c credential.helper= push <url> ...).
+- Cleanup awaiting Victor's yes: worktrees agent-ada5c67 (device-support), agent-a2be35f (first-scan), agent-a9880f0
+  (fork-update-feed), agent-a1382ed (upstream PR prep), all merged/pushed; temp/omb19-try (~8.5 GB, keep until PRs are out);
+  temp/omb-target-{dev,scan,upd,up} build caches.
+- Open: P9-CLIPROXY-VER (Fable 5.2 blocked by proxy version rewrite), P9-SEC-TTYD (ttyd login in ps), Fable 5.2 review of
+  reports/upstream-pr-plan.md, install-linux.sh still points at upstream (Victor's call).
+
+NEXT: watch #106-#109 for maintainer review (answer comments with the leaving-pr-comments skill, fix on the same upstream/*
+branch, push via askpass). When they respond, send wave 2 from reports/upstream-pr-plan.md items 5-14. Ask Victor (AskUserQuestion)
+about the cleanup list above. Skills: delegation-board, leaving-pr-comments, secrets-hygiene.
