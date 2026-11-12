@@ -9,10 +9,6 @@
 // - "Pulsar": Bridge has a dependency-free native Rust driver for it
 //   (src/drivers/pulsar.rs) that claims the brand before this helper is ever
 //   invoked — see src/drivers/mod.rs.
-// - G-Wolves: not yet a finished, exported driver in the local mouse-protocol
-//   checkout (untracked src/g-wolves/, src/drivers/g-wolves/, no package.json
-//   export or registry.ts entry as of this writing) — add it here once it
-//   ships upstream.
 //
 // Vendor ids are copied from mouse-protocol/src/drivers/vendors.ts and each
 // driver's own `isSupported()`; class import paths use the package's
@@ -24,7 +20,34 @@
 // interface's collections on that page, for receivers whose other
 // collections must stay closed (see the Scyrox entry).
 
-const client = (module, exportName) => ({ module, exportName });
+// `productIds` limits a class to the products it speaks for, when one vendor
+// id carries several wire protocols that a probe could confuse.
+const client = (module, exportName, productIds) => ({ module, exportName, productIds });
+
+// G-Wolves ships three protocols under one vendor id; each driver class only
+// checks its product's protocol in the collection-based isSupported(), which
+// this adapter cannot run, so the catalog picks the class instead. Copied per
+// `protocol` from mouse-protocol's GWOLVES_PRODUCTS
+// (src/drivers/gwolves/products.ts, v0.58.0) rather than imported, so this
+// file stays plain data that loads without the package (test-fakes/
+// register.mjs imports it first); brands.test.mjs checks the copy against the
+// installed package when there is one.
+export const GWOLVES_PRODUCT_IDS = {
+  xvi: [
+    0x3908, 0x3917, 0x7904, 0x7913, 0x3708, 0x3717, 0x5308, 0x5317, 0x7704, 0x7713, 0x3508, 0x3517, 0x7908, 0x7917,
+    0x5808, 0x5817, 0x2708, 0x2717, 0x7204, 0x7203, 0x5807, 0x5407, 0x5707, 0x5907, 0x5408, 0x5417, 0x5708, 0x5717,
+    0x5908, 0x5917, 0x7708, 0x7717, 0x5804, 0x5803, 0x5404, 0x5403, 0x5704, 0x5703, 0x5904, 0x5903, 0x001a, 0x00aa,
+  ],
+  "xvi-new": [0x3808, 0x3817, 0x6808, 0x6817, 0x5608, 0x5617, 0x3608, 0x3617],
+  gwolves: [
+    0x5618, 0x3854, 0x5219, 0x5418, 0x4718, 0x4719, 0x5619, 0x5419, 0x3619, 0x2719, 0x4219, 0x2619, 0x3519,
+  ],
+};
+
+// mouse-protocol's SCYROX_PRODUCT_IDS (src/scyrox/index.ts, v0.58.0), copied
+// for the same reason. Keep in step with SCYROX_PRODUCT_IDS in
+// src/drivers/mod.rs.
+export const SCYROX_PRODUCT_IDS = [0xf515, 0xf517, 0xf5f7];
 
 export const BRAND_DRIVERS = {
   zaunkoenig: {
@@ -56,11 +79,7 @@ export const BRAND_DRIVERS = {
   // collections, so only that collection is opened.
   scyrox: {
     vendorIds: [0x3554],
-    // mouse-protocol's SCYROX_PRODUCT_IDS (src/scyrox/index.ts, v0.58.0),
-    // copied rather than imported so this file stays plain data that loads
-    // without the package (test-fakes/register.mjs imports it first). Keep in
-    // step with SCYROX_PRODUCT_IDS in src/drivers/mod.rs.
-    productIds: [0xf515, 0xf517, 0xf5f7],
+    productIds: SCYROX_PRODUCT_IDS,
     usagePage: 0xff02,
     classes: [client("@openmouse/protocol/drivers/scyrox/hid", "ScyroxHidClient")],
   },
@@ -140,6 +159,14 @@ export const BRAND_DRIVERS = {
       client("@openmouse/protocol/drivers/wallhack/keyboard-hid", "WallhackKeyboardHidClient"),
     ],
   },
+  "g-wolves": {
+    vendorIds: [0x33e4],
+    classes: [
+      client("@openmouse/protocol/drivers/gwolves/xvi-hid", "GWolvesXviHidClient", GWOLVES_PRODUCT_IDS.xvi),
+      client("@openmouse/protocol/drivers/gwolves/xvi-new-hid", "GWolvesXviNewHidClient", GWOLVES_PRODUCT_IDS["xvi-new"]),
+      client("@openmouse/protocol/drivers/gwolves/hid", "GWolvesHidClient", GWOLVES_PRODUCT_IDS.gwolves),
+    ],
+  },
   delux: {
     vendorIds: [0x1d57, 0x248a, 0x373e],
     classes: [
@@ -154,4 +181,10 @@ export const BRAND_DRIVERS = {
  * a BRAND_DRIVERS key. */
 export function brandKey(brand) {
   return brand.trim().toLowerCase();
+}
+
+/** The classes of a BRAND_DRIVERS entry worth probing on a device with this
+ * product id: every class, minus those whose `productIds` leave it out. */
+export function classesFor(entry, productId) {
+  return entry.classes.filter((candidate) => !candidate.productIds || candidate.productIds.includes(productId));
 }
