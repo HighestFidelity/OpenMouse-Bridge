@@ -23,13 +23,16 @@ use semver::Version;
 use serde::Deserialize;
 
 /// The newest release's `latest.json`.
-pub(super) const LATEST_JSON_URL: &str =
-    "https://github.com/OpenMouse-Project/OpenMouse-Bridge/releases/latest/download/latest.json";
+pub(super) const LATEST_JSON_URL: &str = concat!(
+    "https://github.com/",
+    update_repo!(),
+    "/releases/latest/download/latest.json"
+);
 /// Overrides [`LATEST_JSON_URL`], to test against a local fake release.
 pub(super) const FEED_URL_ENV: &str = "OPENMOUSE_BRIDGE_UPDATE_FEED_URL";
 /// Where to send someone whose install Bridge cannot replace by itself.
 pub(super) const RELEASES_PAGE: &str =
-    "https://github.com/OpenMouse-Project/OpenMouse-Bridge/releases/latest";
+    concat!("https://github.com/", update_repo!(), "/releases/latest");
 /// The largest asset Bridge will download (the AppImage is the biggest).
 pub(super) const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
 

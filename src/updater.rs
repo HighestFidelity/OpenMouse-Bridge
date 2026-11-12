@@ -18,8 +18,19 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-const LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/OpenMouse-Project/OpenMouse-Bridge/releases/latest";
+/// The GitHub repo whose releases this build updates from. Fork build: the
+/// HighestFidelity fork, so an upstream release never replaces its fixes.
+macro_rules! update_repo {
+    () => {
+        "HighestFidelity/OpenMouse-Bridge"
+    };
+}
+
+const LATEST_RELEASE_URL: &str = concat!(
+    "https://api.github.com/repos/",
+    update_repo!(),
+    "/releases/latest"
+);
 const UPDATE_URL_ENV: &str = "OPENMOUSE_BRIDGE_UPDATE_API_URL";
 const USER_AGENT: &str = "OpenMouse-Bridge-Updater";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(8);
@@ -86,7 +97,9 @@ struct ReleaseAsset {
 /// release is newer than the running Bridge.
 pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
     let url = env::var(feed::FEED_URL_ENV).unwrap_or_else(|_| feed::LATEST_JSON_URL.to_owned());
-    let latest = fetch_feed(&url, signature::configured_key()?).await?;
+    let Some(latest) = fetch_feed(&url, signature::configured_key()?).await? else {
+        return Ok(None);
+    };
     let kind = feed::current_install_kind();
     Ok(
         match feed::offer(&latest, crate::BRIDGE_VERSION, kind.as_ref())? {
@@ -109,8 +122,9 @@ pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
 }
 
 /// Downloads and parses `latest.json`. With a signing `key`, `<url>.sig` must
-/// be a valid signature over the exact bytes downloaded.
-async fn fetch_feed(url: &str, key: Option<[u8; 32]>) -> Result<feed::Feed> {
+/// be a valid signature over the exact bytes downloaded. `None` when there is
+/// no `latest.json` (404): a repo with no release yet has no update to offer.
+async fn fetch_feed(url: &str, key: Option<[u8; 32]>) -> Result<Option<feed::Feed>> {
     let client = reqwest::Client::builder()
         .timeout(CHECK_TIMEOUT)
         .build()
@@ -120,7 +134,12 @@ async fn fetch_feed(url: &str, key: Option<[u8; 32]>) -> Result<feed::Feed> {
         .header(reqwest::header::USER_AGENT, USER_AGENT)
         .send()
         .await
-        .with_context(|| format!("could not check {url}"))?
+        .with_context(|| format!("could not check {url}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        tracing::debug!(%url, "no published latest.json; no update");
+        return Ok(None);
+    }
+    let response = response
         .error_for_status()
         .with_context(|| format!("update check failed for {url}"))?;
     let bytes = read_bounded_response(response, MAX_RELEASE_BYTES).await?;
@@ -136,7 +155,9 @@ async fn fetch_feed(url: &str, key: Option<[u8; 32]>) -> Result<feed::Feed> {
         .context("latest.json has no signature; refusing the update")?;
         signature::verify(&key, &bytes, &signature, "latest.json")?;
     }
-    serde_json::from_slice(&bytes).context("could not parse latest.json")
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .context("could not parse latest.json")
 }
 
 /// The release to finish a stub install with: the latest one, even when it is
