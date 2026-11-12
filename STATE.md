@@ -88,3 +88,12 @@ Open (his calls): N4-N8, N10-N12, N1 activation. Skills: delegation-board for he
 
 NEXT: read reports/upstream-triage.md, brainstorm 2nd-build plan, AskUserQuestion which items to adopt, worktree fixes
 t3/<topic>, review, merge, E-Daddy 2nd build (env 032c749a-..., C:\Users\Victo\OpenMouse-Bridge, Git usr\bin + .cargo\bin on PATH).
+- 2026-11-12 PAUSED for Victor's Claude update (Fable 5.2 child failed: "Claude Code 2.1.280 ... 2.1.290 or newer is required").
+  Picks ledgered (APPROVALS): PR60 Iris, PR62 Scyrox, PR58 G-Wolves, Redragon reader, #79 first-scan fix, updater feed -> fork
+  releases, no Linux items. Upstream PRs (P9-OMB19): split by topic, scope decided after a Fable 5.2 consult.
+  Triage done: reports/upstream-triage.md. Helpers stopped: t3/device-support worktree .claude/worktrees/agent-ada5c67229b726f70
+  (0 commits, PR60 port uncommitted); first-scan and fork-update-feed had no commits (worktrees auto-removed).
+  Origin main still 506c0a3 unless Victor pushed.
+
+NEXT: after the update, relaunch the Fable 5.2 consult (delegate_task claudeHub claude-fable-5-2, effort high) -> reports/upstream-pr-plan.md,
+relaunch 3 helpers (device-support resumes in its worktree; first-scan; fork-update-feed), review, merge, E-Daddy 2nd build, then P9-OMB19.
