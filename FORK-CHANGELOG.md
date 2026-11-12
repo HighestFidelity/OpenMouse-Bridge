@@ -48,3 +48,12 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   reader must match vendor/product/serial/interface/descriptor (FIDO refused), input reports keep flowing during
   slow commands. Windows real-mouse test passed (Victor 2026-11-11 16:28 PT). Linux part not hardware-tested.
 - Cleanup (Victor's yes, APPROVALS 2026-11-12 16:29 PT): 5 merged worktrees removed, branches kept; temp/omb17-* deleted.
+- 2nd build (P9-OMB18, Victor's picks 2026-11-12):
+  - t3/fork-update-feed: in-app updates come from HighestFidelity/OpenMouse-Bridge releases (fork-only); a missing
+    latest.json (404) means up to date. install-linux.sh still points at upstream.
+  - t3/first-scan (upstream #79): the first device scan reads batteries when the startup poll got nothing.
+  - t3/device-support: ports of upstream PRs 60 (Tt eSPORTS Iris), 62 (Scyrox), 58 (G-Wolves) and a Redragon reader
+    (M724, M612, M690 PRO by exact vendor/product ids). None tested on hardware; M690 PRO settings may not load.
+  - Checks on main: fmt ok, cargo test 299+43+11, clippy clean linux + windows-gnu, scripts 16/16, native-hid 32 pass
+    (2 baseline fails need node-hid).
+- Upstream triage and PR plan: reports/upstream-triage.md, reports/upstream-pr-plan.md (Opus; Fable 5.2 review later).

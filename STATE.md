@@ -112,3 +112,12 @@ existing worktree above (cd there, checkout -B t3/<topic>, finish, commit, check
   direct children still hit the proxy, which reports 2.1.280 [Inference]. Fixed script: workspace/temp/t3-restart.sh strips them.
   Plan: when the 3 helpers finish, `setsid nohup bash /home/claude/workspace/temp/t3-restart.sh 60 &`, then relaunch Fable 5.2
   on providerInstanceId claudeAgent. Proxy update later: P9-CLIPROXY-VER.
+
+## 2026-11-12 Update (2nd build merged)
+- Main: merged t3/fork-update-feed, t3/first-scan, t3/device-support. Checks green (see FORK-CHANGELOG).
+- reports/upstream-pr-plan.md (Opus): ~14 upstream PRs, security first; policy bits stay fork-only; don't duplicate PRs 60/62/58.
+  Scratch /home/claude/workspace/temp/omb19-try (~8.5 GB) awaiting Victor's yes to delete.
+- Fable 5.2 blocked by cliproxyapi version rewrite (P9-CLIPROXY-VER). T3 direct "Claude" provider enabled (doesn't help yet).
+
+NEXT: Victor pushes main -> E-Daddy PC child builds the 2nd exe (env 032c749a-..., project c89ec849-..., checkout
+C:\Users\Victo\OpenMouse-Bridge, Git usr\bin + .cargo\bin on PATH) -> Victor tests -> P9-OMB19 upstream PRs per the plan.
