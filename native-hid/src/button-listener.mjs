@@ -60,7 +60,7 @@ async function findClient(entry, wantedName) {
   const closeOthers = () => Promise.all(others.map((other) => other.client.close().catch(() => undefined)));
   for (const vendorId of entry.vendorIds) {
     for (const device of candidateDevices(vendorId, entry)) {
-      for (const candidate of classesFor(entry, device.productId)) {
+      for (const candidate of classesFor(entry, device.productId, device.vendorId)) {
         try {
           const found = await probe(device, candidate);
           // The listener only exists on a client built from a protocol release that has it.

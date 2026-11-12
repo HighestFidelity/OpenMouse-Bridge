@@ -9,6 +9,11 @@
 // - "Pulsar": Bridge has a dependency-free native Rust driver for it
 //   (src/drivers/pulsar.rs) that claims the brand before this helper is ever
 //   invoked — see src/drivers/mod.rs.
+// - Redragon M719RGB-PRO (0x25a7:0xfa7e / 0xfab0): its client's open()
+//   requires the command/notify collections in `device.collections`, which
+//   HidDeviceAdapter leaves empty, so it can never open here.
+// - Redragon M916 Pro 4K (OpenMouse-Bridge#79): no client and no known
+//   product id in mouse-protocol v0.58.0.
 //
 // Vendor ids are copied from mouse-protocol/src/drivers/vendors.ts and each
 // driver's own `isSupported()`; class import paths use the package's
@@ -21,8 +26,9 @@
 // collections must stay closed (see the Scyrox entry).
 
 // `productIds` limits a class to the products it speaks for, when one vendor
-// id carries several wire protocols that a probe could confuse.
-const client = (module, exportName, productIds) => ({ module, exportName, productIds });
+// id carries several wire protocols that a probe could confuse; `vendorId`
+// further limits it to one of its entry's vendor ids.
+const client = (module, exportName, productIds, vendorId) => ({ module, exportName, productIds, vendorId });
 
 // G-Wolves ships three protocols under one vendor id; each driver class only
 // checks its product's protocol in the collection-based isSupported(), which
@@ -48,6 +54,17 @@ export const GWOLVES_PRODUCT_IDS = {
 // for the same reason. Keep in step with SCYROX_PRODUCT_IDS in
 // src/drivers/mod.rs.
 export const SCYROX_PRODUCT_IDS = [0xf515, 0xf517, 0xf5f7];
+
+// Redragon's mice ride other makers' vendor ids, so only these exact products
+// are claimed (same reason for copying). Holtek 0x04d9: mouse-protocol's
+// REDRAGON_PRODUCT_IDS (M724 K1NG 1K, M612 Predator; src/redragon/index.ts).
+// SinoWealth 0x258a: REDRAGON_M690_PRO_PRODUCT_IDS (cable, receiver;
+// src/redragon/m690-pro.ts). Keep in step with KNOWN_PRODUCTS in
+// src/drivers/mod.rs.
+export const REDRAGON_HOLTEK_VENDOR_ID = 0x04d9;
+export const REDRAGON_HOLTEK_PRODUCT_IDS = [0xfc7a, 0xfc61];
+export const REDRAGON_M690_PRO_VENDOR_ID = 0x258a;
+export const REDRAGON_M690_PRO_PRODUCT_IDS = [0x002e, 0x002f];
 
 export const BRAND_DRIVERS = {
   zaunkoenig: {
@@ -167,6 +184,27 @@ export const BRAND_DRIVERS = {
       client("@openmouse/protocol/drivers/gwolves/hid", "GWolvesHidClient", GWOLVES_PRODUCT_IDS.gwolves),
     ],
   },
+  // The M690 PRO's 154-byte config block is longer than the adapter's 91-byte
+  // feature read (hid-device-adapter.mjs), so its status may come back
+  // identity-only with settings off [Inference: not tried on hardware].
+  redragon: {
+    vendorIds: [0x04d9, 0x258a],
+    productIds: [...REDRAGON_HOLTEK_PRODUCT_IDS, ...REDRAGON_M690_PRO_PRODUCT_IDS],
+    classes: [
+      client(
+        "@openmouse/protocol/drivers/redragon/hid",
+        "RedragonHidClient",
+        REDRAGON_HOLTEK_PRODUCT_IDS,
+        REDRAGON_HOLTEK_VENDOR_ID,
+      ),
+      client(
+        "@openmouse/protocol/drivers/redragon/m690-pro-hid",
+        "RedragonM690ProHidClient",
+        REDRAGON_M690_PRO_PRODUCT_IDS,
+        REDRAGON_M690_PRO_VENDOR_ID,
+      ),
+    ],
+  },
   delux: {
     vendorIds: [0x1d57, 0x248a, 0x373e],
     classes: [
@@ -184,7 +222,12 @@ export function brandKey(brand) {
 }
 
 /** The classes of a BRAND_DRIVERS entry worth probing on a device with this
- * product id: every class, minus those whose `productIds` leave it out. */
-export function classesFor(entry, productId) {
-  return entry.classes.filter((candidate) => !candidate.productIds || candidate.productIds.includes(productId));
+ * product id (and vendor id): every class, minus those whose `productIds` or
+ * `vendorId` leave it out. */
+export function classesFor(entry, productId, vendorId) {
+  return entry.classes.filter(
+    (candidate) =>
+      (!candidate.productIds || candidate.productIds.includes(productId)) &&
+      (candidate.vendorId === undefined || candidate.vendorId === vendorId),
+  );
 }

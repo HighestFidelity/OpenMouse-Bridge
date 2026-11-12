@@ -73,6 +73,26 @@ const KNOWN_BRANDS: &[(&str, &[u16])] = &[
     ("G-Wolves", &[0x33e4]),
 ];
 
+/// Brands claimed by exact (vendor id, product ids) rather than by vendor id,
+/// because their mice ride other makers' ids: Redragon's Holtek 0x04d9
+/// (M724 K1NG 1K, M612 Predator; `mouse-protocol`'s `REDRAGON_PRODUCT_IDS`)
+/// carries many other makers' keyboards, and SinoWealth 0x258a (M690 PRO
+/// cable and receiver; `REDRAGON_M690_PRO_PRODUCT_IDS`) Glorious's classic
+/// line. Checked before `KNOWN_BRANDS`. Mirrors the redragon entry in
+/// `native-hid/src/brands.mjs`.
+const KNOWN_PRODUCTS: &[(&str, u16, &[u16])] = &[
+    ("Redragon", 0x04d9, &[0xfc7a, 0xfc61]),
+    ("Redragon", 0x258a, &[0x002e, 0x002f]),
+];
+
+/// The brand `KNOWN_PRODUCTS` gives this exact product, if any.
+fn product_brand(vendor_id: u16, product_id: u16) -> Option<&'static str> {
+    KNOWN_PRODUCTS
+        .iter()
+        .find(|(_, vendor, products)| *vendor == vendor_id && products.contains(&product_id))
+        .map(|(brand, _, _)| *brand)
+}
+
 /// The brand a model name starts with ("Attack Shark R5 Ultra" is Attack
 /// Shark's), for mice that vendor-id discovery labels with another brand.
 pub fn brand_in_name(name: &str) -> Option<&'static str> {
@@ -80,6 +100,7 @@ pub fn brand_in_name(name: &str) -> Option<&'static str> {
     KNOWN_BRANDS
         .iter()
         .map(|(brand, _)| *brand)
+        .chain(KNOWN_PRODUCTS.iter().map(|(brand, _, _)| *brand))
         .filter(|brand| {
             name.strip_prefix(&brand.to_ascii_lowercase())
                 .is_some_and(|rest| rest.starts_with(' '))
@@ -135,6 +156,9 @@ fn discovered_brand(info: &hidapi::DeviceInfo) -> Option<&'static str> {
     }
     if vendor_id == COMPX_VENDOR_ID {
         return compx_brand(info.product_id());
+    }
+    if let Some(brand) = product_brand(vendor_id, info.product_id()) {
+        return Some(brand);
     }
     KNOWN_BRANDS
         .iter()
@@ -824,6 +848,7 @@ mod tests {
             [pulsar::VENDOR_ID, COMPX_VENDOR_ID, LOGITECH_VENDOR_ID].contains(&id)
                 || delux::SUPPORTED_VENDOR_IDS.contains(&id)
                 || KNOWN_BRANDS.iter().any(|(_, ids)| ids.contains(&id))
+                || KNOWN_PRODUCTS.iter().any(|(_, vendor, _)| *vendor == id)
         };
         for id in helper_vendor_ids {
             assert!(
@@ -836,6 +861,7 @@ mod tests {
             .iter()
             .map(|(brand, _)| *brand)
             .chain(compx_brands)
+            .chain(KNOWN_PRODUCTS.iter().map(|(brand, _, _)| *brand))
         {
             let key = brand.trim().to_lowercase();
             assert!(
@@ -856,6 +882,26 @@ mod tests {
         for id in [0xf515, 0xf517, 0xf5f7] {
             assert_eq!(compx_brand(id), Some("Scyrox"));
         }
+    }
+
+    #[test]
+    fn redragon_is_claimed_only_by_its_known_products() {
+        // M724 K1NG 1K and M612 Predator on Holtek, M690 PRO cable and
+        // receiver on SinoWealth.
+        for id in [0xfc7a, 0xfc61] {
+            assert_eq!(product_brand(0x04d9, id), Some("Redragon"));
+        }
+        for id in [0x002e, 0x002f] {
+            assert_eq!(product_brand(0x258a, id), Some("Redragon"));
+        }
+        // Other products on those vendor ids (a Holtek keyboard, Glorious's
+        // classic Model O) and a known product id on the wrong vendor.
+        assert_eq!(product_brand(0x04d9, 0x0006), None);
+        assert_eq!(product_brand(0x258a, 0x0036), None);
+        assert_eq!(product_brand(0x258a, 0xfc7a), None);
+        // Attack Shark keeps 0x25a7; the M719RGB-PRO is not claimed.
+        assert_eq!(product_brand(0x25a7, 0xfa7e), None);
+        assert_eq!(brand_in_name("Redragon M690 PRO"), Some("Redragon"));
     }
 
     #[test]

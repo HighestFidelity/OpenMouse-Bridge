@@ -120,7 +120,7 @@ async function main() {
   let status = null;
   outer: for (const vendorId of entry.vendorIds) {
     for (const device of candidateDevices(vendorId, entry)) {
-      for (const candidate of classesFor(entry, device.productId)) {
+      for (const candidate of classesFor(entry, device.productId, device.vendorId)) {
         try {
           ({ client, status } = await probe(device, candidate));
           break outer;
