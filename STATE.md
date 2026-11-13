@@ -167,3 +167,10 @@ upstream/* branch, push via askpass. When maintainers respond, send wave 2 (repo
 NEXT: when the batch A report says green and pushed: merge t3/upstream-pr-wave2-batch-a (bodies), open the 4 PRs with
 temp/omb19-open-prs.py (head prefix is upstream/ there; pr/ now). After upstream 1.0.1 (Fri 20:00 UTC) is green: batch B
 (7, 8, 9), fork sync merge on t3/sync-upstream, then disable the 2 workflows. Batch C next week (12, 14, 10 alone).
+- Batch A OPEN upstream: #116 remote-image c57645e, #117 native-hid-path 89a64b5, #118 first-scan-battery 48c5835,
+  #119 catalog-save 48431cf (base 86974b1, offline checks green, report reports/wave2-batch-a-20261113.md, bodies merged).
+  Opener: temp/omb19-open-prs.py <token> <bodies> --prefix pr/ <names>. Kept (deleting needs Victor): temp/omb-wave2a
+  scratch worktree, local pr/* branches.
+
+NEXT: watch #116-#119 (temp/omb19-pr-status.py 116 117 118 119). After upstream 1.0.1 (Fri 20:00 UTC) is green: batch B
+(7, 8, 9), fork sync merge on t3/sync-upstream, disable the 2 workflows. Batch C next week (12, 14, 10 alone).
