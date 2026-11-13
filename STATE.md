@@ -154,3 +154,16 @@ about the cleanup list above. Skills: delegation-board, leaving-pr-comments, sec
 
 NEXT: re-run omb19-pr-status.py for maintainer replies on #106-#109; answer with leaving-pr-comments, fix on the same
 upstream/* branch, push via askpass. When maintainers respond, send wave 2 (reports/upstream-pr-plan.md items 5-14).
+
+## 2026-11-13 Update (wave 1 merged, advisor, batch A)
+- Upstream MERGED #106-#109 (2026-11-12 ~23:00Z, no comments). Advisor Fable 5.2 (via T3 provider claudeAgent, works; cliproxy
+  hub still rewrites) -> reports/advisor-post-merge-20261113.md: wave 2 in 3 batches, real merge of upstream/main after 1.0.1.
+- Victor: "Batch A now" (items 5, 6, 11, 13) and "Disable 2 upstream workflows" (after fork sync). Did NOT approve deleting
+  the 4 merged upstream/* branches: keep them.
+- Batch A child (worktree t3/upstream-pr-wave2-batch-a): branches pr/remote-image c57645e, pr/native-hid-path 89a64b5,
+  pr/first-scan-battery 48c5835, pr/catalog-save d95fd64 on upstream 86974b1; checks were running, then it pushes and writes
+  reports/wave2-batch-a-20261113.md.
+
+NEXT: when the batch A report says green and pushed: merge t3/upstream-pr-wave2-batch-a (bodies), open the 4 PRs with
+temp/omb19-open-prs.py (head prefix is upstream/ there; pr/ now). After upstream 1.0.1 (Fri 20:00 UTC) is green: batch B
+(7, 8, 9), fork sync merge on t3/sync-upstream, then disable the 2 workflows. Batch C next week (12, 14, 10 alone).
