@@ -1649,7 +1649,10 @@ fn sibling_order(siblings: &[(&ReportLayout, bool)], report_id: u8) -> Vec<usize
             })
             .map(|(index, _)| index)
     };
-    declaring(true).chain(declaring(false)).collect()
+    // Vendor-page interfaces only: a combo receiver's keyboard or a consumer
+    // control collection never gets a write the page meant for the mouse
+    // (security-audit N5).
+    declaring(true).collect()
 }
 
 /// What two interfaces must share to count as one physical device.
@@ -2982,7 +2985,7 @@ mod tests {
     }
 
     #[test]
-    fn siblings_are_tried_vendor_page_first_and_only_when_they_declare_the_report() {
+    fn only_vendor_page_siblings_that_declare_the_report_are_tried() {
         let consumer = features(&[0]);
         let vendor = features(&[0, 2]);
         let numbered = features(&[2, 3]);
@@ -2993,8 +2996,9 @@ mod tests {
             (&vendor, true),
             (&numbered, true),
         ];
-        // Unnumbered vendor feature report (one shape #16 may have): routed, vendor first.
-        assert_eq!(sibling_order(&siblings, 0), vec![2, 0]);
+        // Unnumbered vendor feature report (one shape #16 may have): routed; the
+        // consumer collection declaring report 0 too is never tried (N5).
+        assert_eq!(sibling_order(&siblings, 0), vec![2]);
         // Numbered only: report 0 finds no sibling, so the opened paths stay all there is.
         assert!(sibling_order(&[(&numbered, true)], 0).is_empty());
         assert_eq!(sibling_order(&siblings, 3), vec![3]);
