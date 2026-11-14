@@ -5,14 +5,18 @@
 //! 0x1000 BATTERY_LEVEL_STATUS a battery level broadcast, both as event 0 of
 //! the feature. Polled by opening and closing the receiver the level can sit
 //! still for a long time (mouse-protocol #170, PRO X2 SUPERSTRIKE); held open,
-//! the events arrive as the level moves. This module parses those events and
-//! runs the listener; the timed poll stays as the fallback.
+//! the events arrive as the level moves. Mice without either (the G305 and
+//! other AA-cell Lightspeed mice) have 0x1001 BATTERY_VOLTAGE, whose event 0
+//! carries a voltage turned into a percent the way mouse-protocol does it.
+//! This module parses those events and runs the listener; the timed poll
+//! stays as the fallback.
 //!
 //! Report layouts, report id at byte 0 as hidapi returns it:
 //! `[0x10 short | 0x11 long, device index, feature index, function << 4 |
 //! software id, params...]`. An event has function 0 and software id 0.
 //! 0x1004 params: `[state of charge %, level flags, charging status, external
-//! power]`; 0x1000 params: `[discharge level %, next level, battery status]`.
+//! power]`; 0x1000 params: `[discharge level %, next level, battery status]`;
+//! 0x1001 params: `[voltage mV high, voltage mV low, flags]`.
 //! The two charging enums differ (mouse-protocol `src/logitech/index.ts`
 //! `decodeUnifiedBatteryState` / `decodeBatteryLevelState`, and the Linux
 //! kernel's `hid-logitech-hidpp.c`), so each has its own table.
@@ -24,7 +28,8 @@
 //! than one request.
 //!
 //! Off by default (`hidppBatteryEvents` in config.json): written from the
-//! documented layouts, not tested on hardware yet.
+//! documented layouts, not tested on hardware yet. Whether a 0x1001 mouse
+//! sends its event 0 unsolicited, and how often, is unverified.
 
 use std::{
     sync::atomic::{AtomicBool, Ordering},
@@ -40,6 +45,7 @@ const READ_LEN: usize = 64;
 
 pub(crate) const UNIFIED_BATTERY: u16 = 0x1004;
 pub(crate) const BATTERY_LEVEL_STATUS: u16 = 0x1000;
+pub(crate) const BATTERY_VOLTAGE: u16 = 0x1001;
 
 /// Bridge's HID++ software id. mouse-protocol uses 0x05, so the panel's and
 /// the helper's replies are never taken for Bridge's; events carry 0.
@@ -69,6 +75,7 @@ const RETRY_AFTER_RELEASE: Duration = Duration::from_secs(5);
 pub(crate) enum BatteryFeature {
     Unified,
     LevelStatus,
+    Voltage,
 }
 
 impl BatteryFeature {
@@ -76,6 +83,7 @@ impl BatteryFeature {
         match self {
             Self::Unified => UNIFIED_BATTERY,
             Self::LevelStatus => BATTERY_LEVEL_STATUS,
+            Self::Voltage => BATTERY_VOLTAGE,
         }
     }
 
@@ -88,10 +96,73 @@ impl BatteryFeature {
             (Self::LevelStatus, 0x02) => ChargeState::AlmostFull,
             (Self::LevelStatus, 0x03) => ChargeState::Full,
             (Self::LevelStatus, 0x04) => ChargeState::ChargingSlowly,
+            (Self::Voltage, flags) => decode_voltage_flags(flags),
             // 0x1004: 4 is a charging fault; 0x1000: 5..7 are battery errors.
             _ => ChargeState::Unknown,
         }
     }
+}
+
+/// 0x1001's flags byte as mouse-protocol's `readBatteryVoltage` reads it
+/// (`src/drivers/logitech/hidpp.ts` 3279-3297 at commit 5a4f643), in its
+/// order: bit 7 charging, and charging with `flags & 0x03 == 2` is full; else
+/// bit 4 is charging slowly (even without bit 7); else bit 7 is charging.
+/// The kernel reads `flags & 0x07` under bit 7 differently (1 full, 2 not
+/// charging); this follows mouse-protocol so events agree with the poll.
+fn decode_voltage_flags(flags: u8) -> ChargeState {
+    let charging = flags & 0x80 != 0;
+    if charging && flags & 0x03 == 0x02 {
+        ChargeState::Full
+    } else if flags & 0x10 != 0 {
+        ChargeState::ChargingSlowly
+    } else if charging {
+        ChargeState::Charging
+    } else {
+        ChargeState::Discharging
+    }
+}
+
+/// mouse-protocol's `BATTERY_VOLTAGE_CURVE` (`src/drivers/logitech/hidpp.ts`
+/// 429-433 at commit 5a4f643): (mV, percent), highest first.
+const BATTERY_VOLTAGE_CURVE: [(u16, u8); 13] = [
+    (4186, 100),
+    (4067, 90),
+    (3989, 80),
+    (3922, 70),
+    (3859, 60),
+    (3811, 50),
+    (3778, 40),
+    (3751, 30),
+    (3717, 20),
+    (3671, 10),
+    (3646, 5),
+    (3579, 2),
+    (3500, 0),
+];
+
+/// mouse-protocol's `estimateBatteryPercent` (hidpp.ts 3313-3324 at commit
+/// 5a4f643): 100 at or above the top point, 0 at or below the bottom one,
+/// else linear between the two points around `mv`, rounded half up like
+/// `Math.round`.
+pub(crate) fn voltage_percent(mv: u16) -> u8 {
+    let (top_mv, _) = BATTERY_VOLTAGE_CURVE[0];
+    let (bottom_mv, _) = BATTERY_VOLTAGE_CURVE[BATTERY_VOLTAGE_CURVE.len() - 1];
+    if mv >= top_mv {
+        return 100;
+    }
+    if mv <= bottom_mv {
+        return 0;
+    }
+    for pair in BATTERY_VOLTAGE_CURVE.windows(2) {
+        let [(high_mv, high_percent), (low_mv, low_percent)] = [pair[0], pair[1]];
+        if mv >= low_mv {
+            let num = u32::from(high_percent - low_percent) * u32::from(mv - low_mv);
+            let den = u32::from(high_mv - low_mv);
+            // round(num / den) for positive values: floor((2num + den) / 2den).
+            return low_percent + ((2 * num + den) / (2 * den)) as u8;
+        }
+    }
+    0
 }
 
 /// The charge state an event reports, named as mouse-protocol names them.
@@ -139,6 +210,18 @@ pub(crate) fn parse_event(report: &[u8], binding: &Binding) -> Option<BatteryEve
         || report[3] != 0x00
     {
         return None;
+    }
+    if binding.feature == BatteryFeature::Voltage {
+        // hidpp.ts reply[3..=5] is report[4..=6] here (report id at byte 0).
+        let mv = u16::from_be_bytes([report[4], report[5]]);
+        // mouse-protocol has no percent for 0 mV (hidpp.ts 3293).
+        if mv == 0 {
+            return None;
+        }
+        return Some(BatteryEvent {
+            percent: voltage_percent(mv),
+            charging: binding.feature.decode_state(report[6]).charging(),
+        });
     }
     let percent = report[4];
     if percent > 100 {
@@ -341,13 +424,19 @@ fn query<G: Gate>(
     Ok(outcome)
 }
 
-/// The battery feature of `device_index`, if it answers HID++ 2.0 at all.
+/// The battery feature of `device_index`, if it answers HID++ 2.0 at all,
+/// in mouse-protocol's order (hidpp.ts 814-824): a percent outright from
+/// 0x1004 or 0x1000 before an estimate from 0x1001.
 fn battery_feature<G: Gate>(
     link: &mut Link,
     gate: &G,
     device_index: u8,
 ) -> Result<Option<Binding>, Unbound> {
-    for feature in [BatteryFeature::Unified, BatteryFeature::LevelStatus] {
+    for feature in [
+        BatteryFeature::Unified,
+        BatteryFeature::LevelStatus,
+        BatteryFeature::Voltage,
+    ] {
         let id = feature.id();
         let Some(reply) = query(
             link,
@@ -564,6 +653,11 @@ mod tests {
         feature_index: 0x06,
         feature: BatteryFeature::LevelStatus,
     };
+    const VOLTAGE: Binding = Binding {
+        device_index: 0x01,
+        feature_index: 0x05,
+        feature: BatteryFeature::Voltage,
+    };
 
     fn long(bytes: &[u8]) -> Vec<u8> {
         let mut report = vec![0; LONG_LEN];
@@ -633,6 +727,67 @@ mod tests {
             parse_event(&long(&[0xff, 0x06, 0x00, 0, 0, 0x00]), &LEVEL),
             event(0, false)
         );
+    }
+
+    #[test]
+    fn the_voltage_curve_matches_mouse_protocol() {
+        // Every point of BATTERY_VOLTAGE_CURVE lands on its own percent.
+        for (mv, percent) in BATTERY_VOLTAGE_CURVE {
+            assert_eq!(voltage_percent(mv), percent, "{mv} mV");
+        }
+        // Clamped at both ends.
+        assert_eq!(voltage_percent(4300), 100);
+        assert_eq!(voltage_percent(u16::MAX), 100);
+        assert_eq!(voltage_percent(3499), 0);
+        assert_eq!(voltage_percent(1), 0);
+        // Linear between points: 20 + 10 * 29 / 46 = 16.3 -> 16.
+        assert_eq!(voltage_percent(3700), 16);
+        // 80 + 10 * 11 / 78 = 81.4 -> 81.
+        assert_eq!(voltage_percent(4000), 81);
+        // 50 + 10 * 12 / 48 = 52.5 rounds up, like Math.round.
+        assert_eq!(voltage_percent(3823), 53);
+        assert_eq!(voltage_percent(3822), 52, "52.29");
+        // One mV above the bottom: 2 * 1 / 79 = 0.03 -> 0.
+        assert_eq!(voltage_percent(3501), 0);
+    }
+
+    #[test]
+    fn voltage_events_parse_with_mouse_protocols_flags() {
+        let at = |mv: u16, flags: u8| {
+            let [high, low] = mv.to_be_bytes();
+            parse_event(&long(&[0x01, 0x05, 0x00, high, low, flags]), &VOLTAGE)
+        };
+        // 0x0F3A = 3898 mV: 60 + 10 * 39 / 63 = 66.2 -> 66, discharging.
+        assert_eq!(at(3898, 0x00), event(66, false));
+        assert_eq!(at(3898, 0x80), event(66, true), "charging");
+        assert_eq!(at(4186, 0x82), event(100, false), "full is not charging");
+        assert_eq!(at(4186, 0x92), event(100, false), "full wins over slow");
+        assert_eq!(at(3898, 0x10), event(66, true), "slow, even without bit 7");
+        assert_eq!(at(3898, 0x90), event(66, true), "charging slowly");
+        // The kernel reads 0x81 as full; mouse-protocol as charging.
+        assert_eq!(at(3898, 0x81), event(66, true));
+        assert_eq!(at(3898, 0x02), event(66, false), "full bits without bit 7");
+        assert_eq!(at(3400, 0x00), event(0, false), "flat is a real 0%");
+        assert_eq!(at(0, 0x00), None, "no voltage, no reading");
+        // The high byte (0x0F) is never taken for a percent.
+        assert_eq!(at(3500, 0x00), event(0, false));
+        // A short report carries all three params.
+        let short = [SHORT_REPORT_ID, 0x01, 0x05, 0x00, 0x0f, 0x3a, 0x80];
+        assert_eq!(parse_event(&short, &VOLTAGE), event(66, true));
+        assert_eq!(parse_event(&short[..6], &VOLTAGE), None, "truncated");
+        // Not an event: a reply, another feature index.
+        let mut reply = short;
+        reply[3] = 0x05;
+        assert_eq!(parse_event(&reply, &VOLTAGE), None);
+        let mut other = short;
+        other[2] = 0x08;
+        assert_eq!(parse_event(&other, &VOLTAGE), None);
+        // The same bytes on a 0x1004 binding read as a percent, not a voltage.
+        let unified = Binding {
+            feature: BatteryFeature::Unified,
+            ..VOLTAGE
+        };
+        assert_eq!(parse_event(&short, &unified), event(15, false));
     }
 
     #[test]
@@ -872,6 +1027,28 @@ mod tests {
         assert_eq!(
             resolve(&mut rig.link, &&FakeGate::free()).map(|binding| binding.feature),
             Ok(BatteryFeature::LevelStatus)
+        );
+        // A G305 has only 0x1001, asked for last.
+        let mut rig = receiver(&[(0x01, Some(BATTERY_VOLTAGE))]);
+        assert_eq!(
+            resolve(&mut rig.link, &&FakeGate::free()),
+            Ok(Binding {
+                device_index: 0x01,
+                feature_index: 0x08,
+                feature: BatteryFeature::Voltage
+            })
+        );
+        let asked: Vec<u16> = rig
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|write| write[1] == 0x01)
+            .map(|write| u16::from_be_bytes([write[4], write[5]]))
+            .collect();
+        assert_eq!(
+            asked,
+            [UNIFIED_BATTERY, BATTERY_LEVEL_STATUS, BATTERY_VOLTAGE]
         );
         // A wired mouse answers as itself.
         let mut rig = receiver(&[(0xff, Some(UNIFIED_BATTERY))]);
