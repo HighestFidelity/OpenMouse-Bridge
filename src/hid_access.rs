@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rule_grants_the_seat_with_logind_and_opens_the_node_without() {
+    fn the_rule_grants_the_seat_with_logind_and_the_owner_without() {
         let seat = rule_for(true, 1000);
         let line = hidraw_line(&seat);
         assert!(line.contains(&format!("PROGRAM=\"/bin/sh {HELPER_PATH} %S%p\"")));

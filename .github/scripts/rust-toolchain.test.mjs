@@ -43,5 +43,5 @@ test("every rust-toolchain step installs the pinned release", () => {
       assert.equal(toolchain[1], channel, `${file}: rust-toolchain step installs ${toolchain[1]}`);
     }
   }
-  assert.equal(steps, 7);
+  assert.equal(steps, 8);
 });

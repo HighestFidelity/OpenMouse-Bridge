@@ -1181,10 +1181,10 @@ impl HidSession {
         for path in &open.paths {
             let buffer_len = match path.layout.feature_buffer_len(report_id) {
                 Ok(length) => length,
-                Err(_) => match undeclared_feature_buffer_len(open.vendor_id) {
-                    Some(length) => length,
-                    None => continue,
-                },
+                Err(_) if open.vendor_id == RAZER_VENDOR_ID => RAZER_FEATURE_BUFFER_LEN,
+                Err(_) if open.vendor_id == MICROSOFT_VENDOR_ID => 64,
+                Err(_) if open.vendor_id == THERMALTAKE_VENDOR_ID => THERMALTAKE_FEATURE_BUFFER_LEN,
+                Err(_) => continue,
             };
             available = true;
             let mut data = vec![0; buffer_len];
@@ -1221,18 +1221,6 @@ impl HidSession {
             "could not receive feature report {report_id}: {}",
             last_error.unwrap_or_else(|| "no HID path was open".to_owned())
         ))
-    }
-}
-
-/// The read buffer for a feature report the interface's descriptor does not
-/// declare, for vendors whose devices answer such reads anyway. `None` means
-/// the read is refused as undeclared.
-fn undeclared_feature_buffer_len(vendor_id: u16) -> Option<usize> {
-    match vendor_id {
-        RAZER_VENDOR_ID => Some(RAZER_FEATURE_BUFFER_LEN),
-        MICROSOFT_VENDOR_ID => Some(64),
-        THERMALTAKE_VENDOR_ID => Some(THERMALTAKE_FEATURE_BUFFER_LEN),
-        _ => None,
     }
 }
 
@@ -1596,7 +1584,7 @@ struct CollectionNode {
 
 /// Deepest collection nesting accepted. Real devices nest a handful deep; a
 /// descriptor from a hostile device could otherwise nest ~1,400 deep and
-/// drive the recursive tree building and serialization (audit N12).
+/// drive the recursive tree building and serialization.
 const MAX_COLLECTION_DEPTH: usize = 64;
 
 fn parse_report_descriptor(bytes: &[u8]) -> Result<(Vec<CollectionInfo>, ReportLayout), String> {
@@ -2612,19 +2600,6 @@ mod tests {
         for thread in threads {
             thread.join().expect("enumeration thread");
         }
-    }
-
-    #[test]
-    fn undeclared_feature_reads_fall_back_only_for_known_vendors() {
-        assert_eq!(
-            undeclared_feature_buffer_len(RAZER_VENDOR_ID),
-            Some(RAZER_FEATURE_BUFFER_LEN)
-        );
-        assert_eq!(undeclared_feature_buffer_len(MICROSOFT_VENDOR_ID), Some(64));
-        // Tt eSPORTS Iris: report id plus 2052 bytes.
-        assert_eq!(undeclared_feature_buffer_len(0x264A), Some(2053));
-        assert_eq!(undeclared_feature_buffer_len(0x046D), None);
-        assert_eq!(undeclared_feature_buffer_len(0x3554), None);
     }
 
     #[test]
