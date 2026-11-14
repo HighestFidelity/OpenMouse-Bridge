@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
+    ops::ControlFlow,
     sync::{
         Arc, Mutex, Once, OnceLock, PoisonError,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -36,6 +37,9 @@ const RAZER_VENDOR_ID: u16 = 0x1532;
 const FIDO_USAGE_PAGE: u16 = 0xF1D0;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
 const THERMALTAKE_VENDOR_ID: u16 = 0x264A;
+/// Vendor-defined usage pages start here.
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+const VENDOR_USAGE_PAGE: u16 = 0xff00;
 /// The Iris's config collection holds only constant items, so Windows gives it
 /// no caps and hidapi's rebuilt descriptor declares none of its 2052-byte
 /// feature reports. Reads use this buffer (report id plus 2052 bytes) instead.
@@ -355,6 +359,9 @@ impl ReportLayout {
 struct CandidatePath {
     path: CString,
     layout: ReportLayout,
+    /// Whether `layout` came from the path's report descriptor. Razer
+    /// descriptors are not read, so their layout is empty and says nothing.
+    descriptor_known: bool,
 }
 
 #[derive(Clone)]
@@ -368,6 +375,17 @@ struct OpenPath {
     path: CString,
     device: Arc<Mutex<HidDevice>>,
     layout: ReportLayout,
+    descriptor_known: bool,
+}
+
+/// Another interface of the same physical device (same vendor, product,
+/// serial and USB port or Windows container) that declares feature reports.
+/// Feature reports only: no reader, no output or input reports.
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+struct SiblingPath {
+    device: Mutex<HidDevice>,
+    layout: ReportLayout,
+    vendor_page: bool,
 }
 
 /// The handle an input reader thread reads from.
@@ -547,6 +565,8 @@ struct OpenDevice {
     listening: bool,
     stop: Option<Arc<AtomicBool>>,
     readers: Vec<thread::JoinHandle<()>>,
+    /// Found the first time a feature report needs them, kept until close.
+    feature_siblings: OnceLock<Vec<SiblingPath>>,
 }
 
 impl OpenDevice {
@@ -853,6 +873,7 @@ impl HidSession {
                     path: candidate_path.path.clone(),
                     device: Arc::new(Mutex::new(device)),
                     layout: candidate_path.layout.clone(),
+                    descriptor_known: candidate_path.descriptor_known,
                 }),
                 Err(error) => errors.push(error.to_string()),
             }
@@ -880,6 +901,7 @@ impl HidSession {
                 listening: false,
                 stop: None,
                 readers: Vec::new(),
+                feature_siblings: OnceLock::new(),
             },
         );
         if self.listeners.contains(key) {
@@ -1090,11 +1112,10 @@ impl HidSession {
         frame.push(report_id);
         frame.extend_from_slice(&data);
         let mut last_error = None;
-        let layouts: Vec<&ReportLayout> = open.paths.iter().map(|path| &path.layout).collect();
-        for index in report_paths(&layouts, report_id, feature) {
-            let path = &open.paths[index];
-            let result = path
-                .device
+        // The first path that takes the report is the only one written, so a
+        // command never reaches the device twice.
+        let mut write = |device: &Mutex<HidDevice>| {
+            let result = device
                 .lock()
                 .map_err(|_| "native HID lock was poisoned".to_owned())
                 .and_then(|device| {
@@ -1105,11 +1126,27 @@ impl HidSession {
                     }
                     .map_err(|error| error.to_string())
                 });
-            // The first path that takes the report is the only one written, so a
-            // command never reaches the device twice.
             match result {
-                Ok(()) => return Ok(()),
-                Err(error) => last_error = Some(error),
+                Ok(()) => ControlFlow::Break(()),
+                Err(error) => {
+                    last_error = Some(error);
+                    ControlFlow::Continue(())
+                }
+            }
+        };
+        if feature {
+            if self
+                .route_feature(key, open, report_id, &mut |device, _| write(device))
+                .is_break()
+            {
+                return Ok(());
+            }
+        } else {
+            let layouts: Vec<&ReportLayout> = open.paths.iter().map(|path| &path.layout).collect();
+            for index in report_paths(&layouts, report_id, false) {
+                if write(&open.paths[index].device).is_break() {
+                    return Ok(());
+                }
             }
         }
         let operation = if feature { "feature" } else { "output" };
@@ -1176,21 +1213,22 @@ impl HidSession {
             .get(key)
             .ok_or_else(|| "the HID interface is not open".to_owned())?;
         let mut available = false;
+        let mut response = None;
         let mut fallback_response = None;
         let mut last_error = None;
-        for path in &open.paths {
-            let buffer_len = match path.layout.feature_buffer_len(report_id) {
+        let vendor_id = open.vendor_id;
+        let _ = self.route_feature(key, open, report_id, &mut |device, layout| {
+            let buffer_len = match layout.feature_buffer_len(report_id) {
                 Ok(length) => length,
-                Err(_) if open.vendor_id == RAZER_VENDOR_ID => RAZER_FEATURE_BUFFER_LEN,
-                Err(_) if open.vendor_id == MICROSOFT_VENDOR_ID => 64,
-                Err(_) if open.vendor_id == THERMALTAKE_VENDOR_ID => THERMALTAKE_FEATURE_BUFFER_LEN,
-                Err(_) => continue,
+                Err(_) if vendor_id == RAZER_VENDOR_ID => RAZER_FEATURE_BUFFER_LEN,
+                Err(_) if vendor_id == MICROSOFT_VENDOR_ID => 64,
+                Err(_) if vendor_id == THERMALTAKE_VENDOR_ID => THERMALTAKE_FEATURE_BUFFER_LEN,
+                Err(_) => return ControlFlow::Continue(()),
             };
             available = true;
             let mut data = vec![0; buffer_len];
             data[0] = report_id;
-            let result = path
-                .device
+            let result = device
                 .lock()
                 .map_err(|_| "native HID lock was poisoned".to_owned())
                 .and_then(|device| {
@@ -1200,16 +1238,18 @@ impl HidSession {
                 });
             match result {
                 Ok(size) => {
-                    let response = report_payload(&data, size);
-                    if open.vendor_id != RAZER_VENDOR_ID || response.iter().any(|byte| *byte != 0) {
-                        return Ok(response);
+                    let payload = report_payload(&data, size);
+                    if vendor_id != RAZER_VENDOR_ID || payload.iter().any(|byte| *byte != 0) {
+                        response = Some(payload);
+                        return ControlFlow::Break(());
                     }
-                    fallback_response.get_or_insert(response);
+                    fallback_response.get_or_insert(payload);
                 }
                 Err(error) => last_error = Some(error),
             }
-        }
-        if let Some(response) = fallback_response {
+            ControlFlow::Continue(())
+        });
+        if let Some(response) = response.or(fallback_response) {
             return Ok(response);
         }
         if !available {
@@ -1221,6 +1261,71 @@ impl HidSession {
             "could not receive feature report {report_id}: {}",
             last_error.unwrap_or_else(|| "no HID path was open".to_owned())
         ))
+    }
+
+    /// Offers a feature report to the paths that may take it, in order, until
+    /// `attempt` breaks. The opened paths that declare the report go first and
+    /// alone, as before. When none declares it, sibling interfaces of the same
+    /// physical device that do are tried too: before the opened paths when
+    /// their descriptors show no feature report at all, after them otherwise
+    /// (Razer, whose descriptors are not read, and the vendors whose undeclared
+    /// reports are known to work), so a path that works today still goes first.
+    fn route_feature(
+        &self,
+        key: &str,
+        open: &OpenDevice,
+        report_id: u8,
+        attempt: &mut dyn FnMut(&Mutex<HidDevice>, &ReportLayout) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let opened: Vec<(&ReportLayout, bool)> = open
+            .paths
+            .iter()
+            .map(|path| (&path.layout, path.descriptor_known))
+            .collect();
+        let quirks = matches!(
+            open.vendor_id,
+            RAZER_VENDOR_ID | MICROSOFT_VENDOR_ID | THERMALTAKE_VENDOR_ID
+        );
+        let all_opened = (0..open.paths.len()).collect::<Vec<_>>();
+        match feature_route(&opened, report_id, quirks) {
+            FeatureRoute::Declared(indexes) => try_opened_paths(&open.paths, indexes, attempt),
+            FeatureRoute::SiblingsFirst => {
+                self.try_feature_siblings(key, open, report_id, attempt)?;
+                try_opened_paths(&open.paths, all_opened, attempt)
+            }
+            FeatureRoute::OpenedFirst => {
+                try_opened_paths(&open.paths, all_opened, attempt)?;
+                self.try_feature_siblings(key, open, report_id, attempt)
+            }
+        }
+    }
+
+    fn try_feature_siblings(
+        &self,
+        key: &str,
+        open: &OpenDevice,
+        report_id: u8,
+        attempt: &mut dyn FnMut(&Mutex<HidDevice>, &ReportLayout) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let siblings = open.feature_siblings.get_or_init(|| {
+            let siblings = scan_feature_siblings(&self.api, open);
+            tracing::info!(
+                session_id = self.session_id,
+                device_key = key,
+                siblings = siblings.len(),
+                "HID feature siblings resolved"
+            );
+            siblings
+        });
+        let routes: Vec<(&ReportLayout, bool)> = siblings
+            .iter()
+            .map(|sibling| (&sibling.layout, sibling.vendor_page))
+            .collect();
+        for index in sibling_order(&routes, report_id) {
+            let sibling = &siblings[index];
+            attempt(&sibling.device, &sibling.layout)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -1495,6 +1600,245 @@ fn report_paths(layouts: &[&ReportLayout], report_id: u8, feature: bool) -> Vec<
     }
 }
 
+/// Where a feature report goes when it is sent to or read from an open device.
+#[derive(Debug, PartialEq)]
+enum FeatureRoute {
+    /// These opened paths declare it; nothing else is tried.
+    Declared(Vec<usize>),
+    /// The opened descriptors were read and declare no feature report at all:
+    /// sibling interfaces that declare it first, then every opened path.
+    SiblingsFirst,
+    /// Every opened path first (as before), then sibling interfaces.
+    OpenedFirst,
+}
+
+/// `opened` is each opened path's layout and whether it came from a read
+/// descriptor. `quirks` marks the vendors whose undeclared feature reports
+/// are known to work on the opened path (Razer, Microsoft, Thermaltake).
+fn feature_route(opened: &[(&ReportLayout, bool)], report_id: u8, quirks: bool) -> FeatureRoute {
+    let declared: Vec<usize> = opened
+        .iter()
+        .enumerate()
+        .filter(|(_, (layout, _))| layout.feature_bits.contains_key(&report_id))
+        .map(|(index, _)| index)
+        .collect();
+    if !declared.is_empty() {
+        return FeatureRoute::Declared(declared);
+    }
+    let known_featureless = !opened.is_empty()
+        && opened
+            .iter()
+            .all(|(layout, known)| *known && layout.feature_bits.is_empty());
+    if known_featureless && !quirks {
+        FeatureRoute::SiblingsFirst
+    } else {
+        FeatureRoute::OpenedFirst
+    }
+}
+
+/// The siblings to try for a feature report: only those that declare it,
+/// vendor-defined interfaces first, each group in enumeration order.
+/// `siblings` is each sibling's layout and whether it has a vendor-page collection.
+fn sibling_order(siblings: &[(&ReportLayout, bool)], report_id: u8) -> Vec<usize> {
+    let declaring = |vendor: bool| {
+        siblings
+            .iter()
+            .enumerate()
+            .filter(move |(_, (layout, is_vendor))| {
+                *is_vendor == vendor && layout.feature_bits.contains_key(&report_id)
+            })
+            .map(|(index, _)| index)
+    };
+    declaring(true).chain(declaring(false)).collect()
+}
+
+/// What two interfaces must share to count as one physical device.
+#[derive(Debug, PartialEq)]
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+struct PhysicalIdentity {
+    vendor_id: u16,
+    product_id: u16,
+    serial: Option<String>,
+    /// The USB port (Linux) or Windows container the interface belongs to.
+    physical: Vec<u8>,
+}
+
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+impl PhysicalIdentity {
+    fn new(vendor_id: u16, product_id: u16, serial: Option<&str>, physical: Vec<u8>) -> Self {
+        Self {
+            vendor_id,
+            product_id,
+            serial: serial
+                .filter(|serial| !serial.is_empty())
+                .map(str::to_owned),
+            physical,
+        }
+    }
+}
+
+/// The USB port of a hidraw node, from its `uevent`: `HID_PHYS` without the
+/// trailing `/inputN` (`usb-0000:00:14.0-2/input2` -> `usb-0000:00:14.0-2`).
+/// Anything else (Bluetooth, whose `HID_PHYS` is the adapter's address and
+/// so the same for every device on it, receiver children, virtual devices)
+/// has no port, so it never gets siblings.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn usb_port_from_uevent(uevent: &str) -> Option<String> {
+    let phys = uevent
+        .lines()
+        .find_map(|line| line.strip_prefix("HID_PHYS="))?;
+    let (port, interface) = phys.rsplit_once('/')?;
+    let number = interface.strip_prefix("input")?;
+    (port.starts_with("usb-")
+        && !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit()))
+    .then(|| port.to_owned())
+}
+
+/// A Windows container id as a physical key, unless it is the null id or the
+/// computer's own container ({00000000-0000-0000-FFFF-FFFFFFFFFFFF}), which
+/// every non-removable device shares, so it proves nothing.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn usable_container_id(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> Option<Vec<u8>> {
+    let empty = data1 == 0 && data2 == 0 && data3 == 0;
+    if empty && (data4 == [0; 8] || data4 == [0xff; 8]) {
+        return None;
+    }
+    let mut key = Vec::with_capacity(16);
+    key.extend_from_slice(&data1.to_le_bytes());
+    key.extend_from_slice(&data2.to_le_bytes());
+    key.extend_from_slice(&data3.to_le_bytes());
+    key.extend_from_slice(&data4);
+    Some(key)
+}
+
+#[cfg(target_os = "windows")]
+fn physical_device_key(device: &HidDevice, _path: &std::ffi::CStr) -> Option<Vec<u8>> {
+    let id = device.get_container_id().ok()?;
+    usable_container_id(id.data1, id.data2, id.data3, id.data4)
+}
+
+#[cfg(target_os = "linux")]
+fn physical_device_key(_device: &HidDevice, path: &std::ffi::CStr) -> Option<Vec<u8>> {
+    let node = path.to_str().ok()?.strip_prefix("/dev/")?;
+    let uevent = std::fs::read_to_string(format!("/sys/class/hidraw/{node}/device/uevent")).ok()?;
+    usb_port_from_uevent(&uevent).map(String::into_bytes)
+}
+
+/// The identity of an open handle: vendor, product and serial from the handle
+/// itself, the physical key from the handle (Windows) or its node (Linux).
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn physical_identity(device: &HidDevice, path: &std::ffi::CStr) -> Option<PhysicalIdentity> {
+    let info = device.get_device_info().ok()?;
+    Some(PhysicalIdentity::new(
+        info.vendor_id(),
+        info.product_id(),
+        info.serial_number(),
+        physical_device_key(device, path)?,
+    ))
+}
+
+/// Whether an enumerated interface may be a feature sibling of an open
+/// device: the same vendor and product, not already open, and through the
+/// same filters `list` applies (no security keys, no receiver children).
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+fn sibling_candidate(
+    expected: &PhysicalIdentity,
+    vendor_id: u16,
+    product_id: u16,
+    opened: bool,
+    blocked: bool,
+    receiver_child: bool,
+) -> bool {
+    vendor_id == expected.vendor_id
+        && product_id == expected.product_id
+        && !opened
+        && !blocked
+        && !receiver_child
+}
+
+/// Opens the other interfaces of an open device's physical device that
+/// declare feature reports. Any failure skips that interface: this only ever
+/// adds paths to try, so the device keeps working without it.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn scan_feature_siblings(api: &HidApi, open: &OpenDevice) -> Vec<SiblingPath> {
+    let Some(expected) = open.paths.iter().find_map(|path| {
+        let device = path.device.lock().ok()?;
+        physical_identity(&device, &path.path)
+    }) else {
+        return Vec::new();
+    };
+    let opened: HashSet<&std::ffi::CStr> =
+        open.paths.iter().map(|path| path.path.as_c_str()).collect();
+    let blocked = security_key_paths(api);
+    let mut seen = HashSet::new();
+    let mut siblings = Vec::new();
+    for info in api.device_list() {
+        if !sibling_candidate(
+            &expected,
+            info.vendor_id(),
+            info.product_id(),
+            opened.contains(info.path()),
+            blocked.contains(info.path()),
+            is_receiver_child(info.path()),
+        ) || !seen.insert(info.path().to_owned())
+        {
+            continue;
+        }
+        let Ok(device) = api.open_path(info.path()) else {
+            continue;
+        };
+        if physical_identity(&device, info.path()).as_ref() != Some(&expected) {
+            continue;
+        }
+        let mut descriptor = vec![0; MAX_REPORT_DESCRIPTOR_SIZE];
+        let Ok(size) = device.get_report_descriptor(&mut descriptor) else {
+            continue;
+        };
+        let Some((layout, vendor_page)) = sibling_layout(&descriptor[..size]) else {
+            continue;
+        };
+        siblings.push(SiblingPath {
+            device: Mutex::new(device),
+            layout,
+            vendor_page,
+        });
+    }
+    siblings
+}
+
+/// A sibling's layout and whether it has a vendor-page collection, when its
+/// descriptor parses, declares feature reports and holds no FIDO collection.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn sibling_layout(descriptor: &[u8]) -> Option<(ReportLayout, bool)> {
+    let (collections, layout) = parse_report_descriptor(descriptor).ok()?;
+    if has_security_key_collection(&collections) || layout.feature_bits.is_empty() {
+        return None;
+    }
+    let vendor_page = collections
+        .iter()
+        .any(|collection| collection.usage_page >= VENDOR_USAGE_PAGE);
+    Some((layout, vendor_page))
+}
+
+/// macOS and the libusb backends keep the opened paths only.
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn scan_feature_siblings(_api: &HidApi, _open: &OpenDevice) -> Vec<SiblingPath> {
+    Vec::new()
+}
+
+fn try_opened_paths(
+    paths: &[OpenPath],
+    indexes: Vec<usize>,
+    attempt: &mut dyn FnMut(&Mutex<HidDevice>, &ReportLayout) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    for index in indexes {
+        let path = &paths[index];
+        attempt(&path.device, &path.layout)?;
+    }
+    ControlFlow::Continue(())
+}
+
 fn collection_interface(path: &[u8]) -> Option<String> {
     let path = std::str::from_utf8(path).ok()?.to_ascii_lowercase();
     let (hardware, rest) = path.strip_prefix(r"\\?\hid#")?.split_once('#')?;
@@ -1533,6 +1877,7 @@ fn inspect_candidate(
                 })
             })
             .flatten();
+        let descriptor_known = parsed.is_some();
         let layout = if let Some((mut path_collections, path_layout)) = parsed {
             collections.append(&mut path_collections);
             path_layout
@@ -1549,7 +1894,11 @@ fn inspect_candidate(
             );
             ReportLayout::default()
         };
-        paths.push(CandidatePath { path, layout });
+        paths.push(CandidatePath {
+            path,
+            layout,
+            descriptor_known,
+        });
     }
 
     Ok(Candidate {
@@ -2560,6 +2909,7 @@ mod tests {
                     listening: true,
                     stop: Some(Arc::clone(flag)),
                     readers: vec![reader],
+                    feature_siblings: OnceLock::new(),
                 },
             );
         }
@@ -2581,6 +2931,195 @@ mod tests {
         // Undeclared (a Razer path without parsed descriptors): every path is a candidate, tried in order.
         assert_eq!(report_paths(&layouts, 0x00, true), vec![0, 1, 2]);
         assert!(report_paths(&[], 0x11, true).is_empty());
+    }
+
+    fn features(ids: &[u8]) -> ReportLayout {
+        let mut layout = ReportLayout::default();
+        for id in ids {
+            layout.feature_bits.insert(*id, 90 * 8);
+        }
+        layout
+    }
+
+    #[test]
+    fn a_feature_report_declared_by_an_opened_path_never_reaches_a_sibling() {
+        let mouse = ReportLayout::default();
+        let vendor = features(&[0]);
+        assert_eq!(
+            feature_route(&[(&mouse, true), (&vendor, true)], 0, false),
+            FeatureRoute::Declared(vec![1])
+        );
+        assert_eq!(
+            feature_route(&[(&vendor, true)], 0, true),
+            FeatureRoute::Declared(vec![0])
+        );
+    }
+
+    #[test]
+    fn siblings_go_first_only_when_the_opened_descriptors_have_no_feature_reports() {
+        let mouse = ReportLayout::default();
+        let other = features(&[5]);
+        // Known and featureless (#16's 0x1:2 interface): siblings first.
+        assert_eq!(
+            feature_route(&[(&mouse, true)], 0, false),
+            FeatureRoute::SiblingsFirst
+        );
+        // Unread descriptors (Razer) and vendor quirks keep today's paths first.
+        assert_eq!(
+            feature_route(&[(&mouse, false)], 0, false),
+            FeatureRoute::OpenedFirst
+        );
+        assert_eq!(
+            feature_route(&[(&mouse, true)], 0, true),
+            FeatureRoute::OpenedFirst
+        );
+        // An opened path with other feature reports is feature capable: it stays first.
+        assert_eq!(
+            feature_route(&[(&mouse, true), (&other, true)], 0, false),
+            FeatureRoute::OpenedFirst
+        );
+        assert_eq!(feature_route(&[], 0, false), FeatureRoute::OpenedFirst);
+    }
+
+    #[test]
+    fn siblings_are_tried_vendor_page_first_and_only_when_they_declare_the_report() {
+        let consumer = features(&[0]);
+        let vendor = features(&[0, 2]);
+        let numbered = features(&[2, 3]);
+        let featureless = ReportLayout::default();
+        let siblings = [
+            (&consumer, false),
+            (&featureless, true),
+            (&vendor, true),
+            (&numbered, true),
+        ];
+        // Unnumbered vendor feature report (one shape #16 may have): routed, vendor first.
+        assert_eq!(sibling_order(&siblings, 0), vec![2, 0]);
+        // Numbered only: report 0 finds no sibling, so the opened paths stay all there is.
+        assert!(sibling_order(&[(&numbered, true)], 0).is_empty());
+        assert_eq!(sibling_order(&siblings, 3), vec![3]);
+        assert!(sibling_order(&[], 0).is_empty());
+    }
+
+    #[test]
+    fn a_hidraw_node_is_placed_by_its_usb_port_only() {
+        let uevent = |phys: &str| {
+            format!("DRIVER=razerkbd\nHID_ID=0003:00001532:0000026B\nHID_PHYS={phys}\nHID_UNIQ=\n")
+        };
+        let input2 = usb_port_from_uevent(&uevent("usb-0000:00:14.0-2/input2"));
+        let input3 = usb_port_from_uevent(&uevent("usb-0000:00:14.0-2/input3"));
+        assert_eq!(input2.as_deref(), Some("usb-0000:00:14.0-2"));
+        assert_eq!(input2, input3, "interfaces of one device share a port");
+        assert_ne!(
+            input2,
+            usb_port_from_uevent(&uevent("usb-0000:00:14.0-3/input2")),
+            "an identical device on another port is another device"
+        );
+        // Bluetooth phys is the adapter, shared by every device: no siblings.
+        assert_eq!(usb_port_from_uevent(&uevent("a4:c3:f0:12:34:56")), None);
+        // A receiver child (input2:1) and malformed values: no siblings.
+        assert_eq!(
+            usb_port_from_uevent(&uevent("usb-0000:00:14.0-9/input2:1")),
+            None
+        );
+        assert_eq!(
+            usb_port_from_uevent(&uevent("usb-0000:00:14.0-9/input")),
+            None
+        );
+        assert_eq!(usb_port_from_uevent("DRIVER=hid-generic\n"), None);
+    }
+
+    #[test]
+    fn the_computer_container_and_the_null_container_prove_nothing() {
+        assert_eq!(usable_container_id(0, 0, 0, [0; 8]), None);
+        assert_eq!(usable_container_id(0, 0, 0, [0xff; 8]), None);
+        let device = usable_container_id(0x1234_5678, 0x9abc, 0xdef0, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(device.as_ref().map(Vec::len), Some(16));
+        assert_ne!(
+            device,
+            usable_container_id(0x1234_5678, 0x9abc, 0xdef0, [1, 2, 3, 4, 5, 6, 7, 9])
+        );
+    }
+
+    #[test]
+    fn identical_devices_without_a_serial_never_become_siblings() {
+        let port = |name: &str| name.as_bytes().to_vec();
+        let opened = PhysicalIdentity::new(0x1532, 0x026b, None, port("usb-1-2"));
+        assert_eq!(
+            opened,
+            PhysicalIdentity::new(0x1532, 0x026b, Some(""), port("usb-1-2")),
+            "an empty serial is no serial"
+        );
+        assert_ne!(
+            opened,
+            PhysicalIdentity::new(0x1532, 0x026b, None, port("usb-1-3"))
+        );
+        assert_ne!(
+            opened,
+            PhysicalIdentity::new(0x1532, 0x026b, Some("A1"), port("usb-1-2"))
+        );
+        assert_ne!(
+            opened,
+            PhysicalIdentity::new(0x1532, 0x026c, None, port("usb-1-2"))
+        );
+    }
+
+    #[test]
+    fn siblings_pass_the_same_filters_as_the_device_list() {
+        let expected = PhysicalIdentity::new(0x1532, 0x026b, None, Vec::new());
+        assert!(sibling_candidate(
+            &expected, 0x1532, 0x026b, false, false, false
+        ));
+        assert!(
+            !sibling_candidate(&expected, 0x1532, 0x026b, true, false, false),
+            "already open"
+        );
+        assert!(
+            !sibling_candidate(&expected, 0x1532, 0x026b, false, true, false),
+            "security key"
+        );
+        assert!(
+            !sibling_candidate(&expected, 0x1532, 0x026b, false, false, true),
+            "receiver child"
+        );
+        assert!(!sibling_candidate(
+            &expected, 0x1532, 0x0084, false, false, false
+        ));
+        assert!(!sibling_candidate(
+            &expected, 0x046d, 0x026b, false, false, false
+        ));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn a_sibling_must_declare_feature_reports_and_hold_no_security_key() {
+        let vendor = [
+            0x06, 0x00, 0xff, // Usage Page 0xff00
+            0x09, 0x01, // Usage 1
+            0xa1, 0x01, // Collection (Application)
+            0x75, 0x08, // Report Size 8
+            0x95, 0x5a, // Report Count 90
+            0xb1, 0x02, // Feature (unnumbered)
+            0xc0, // End Collection
+        ];
+        let (layout, vendor_page) = sibling_layout(&vendor).expect("a vendor feature sibling");
+        assert!(vendor_page);
+        assert_eq!(layout.feature_buffer_len(0).unwrap(), 91);
+        let mut fido = vendor;
+        fido[1] = 0xd0;
+        fido[2] = 0xf1; // Usage Page 0xf1d0, still declaring feature report 0
+        assert!(sibling_layout(&fido).is_none());
+        let mouse_without_features = [
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02, 0xc0,
+        ];
+        assert!(sibling_layout(&mouse_without_features).is_none());
+        let consumer = [
+            0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01, 0x75, 0x08, 0x95, 0x04, 0xb1, 0x02, 0xc0,
+        ];
+        assert_eq!(
+            sibling_layout(&consumer).map(|(_, vendor)| vendor),
+            Some(false)
+        );
     }
 
     #[test]
@@ -2688,6 +3227,7 @@ mod tests {
                     listening: false,
                     stop: None,
                     readers: Vec::new(),
+                    feature_siblings: OnceLock::new(),
                 },
             );
             session.listeners.insert(key.into());
