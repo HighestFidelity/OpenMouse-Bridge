@@ -26,6 +26,7 @@ pub fn without_no_driver_errors(message: &str) -> Option<String> {
     automation::without_no_driver(message)
 }
 pub mod delux;
+pub(crate) mod hidpp_battery;
 mod lamzu;
 mod native_hid;
 pub mod pulsar;

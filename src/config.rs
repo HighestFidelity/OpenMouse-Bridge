@@ -43,6 +43,12 @@ pub struct BridgeConfig {
     /// moment it connects, applying the stored settings again on disconnect.
     #[serde(default = "enabled_by_default")]
     pub hybrid_mode: bool,
+    /// Keep a Logitech receiver open and take its HID++ battery events
+    /// (0x1004 / 0x1000) as they arrive, with the timed poll as fallback.
+    /// Off unless set in config.json: not tested on hardware yet. Read at
+    /// startup.
+    #[serde(default)]
+    pub hidpp_battery_events: bool,
     #[serde(default)]
     pub games: Vec<GameConfig>,
     /// Games the user added by hand. Kept apart from `games` because the
@@ -205,6 +211,7 @@ impl Default for BridgeConfig {
             notification_volume: DEFAULT_NOTIFICATION_VOLUME,
             tray_battery_style: default_tray_battery_style(),
             hybrid_mode: true,
+            hidpp_battery_events: false,
             games: Vec::new(),
             custom_games: Vec::new(),
             local_applications: Vec::new(),
@@ -853,6 +860,7 @@ mod tests {
             custom_games: Vec::new(),
             tray_battery_style: " percentage ".to_owned(),
             hybrid_mode: true,
+            hidpp_battery_events: false,
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: Vec::new(),
@@ -940,6 +948,15 @@ mod tests {
         let config: BridgeConfig =
             serde_json::from_str(r#"{"hybridMode": false}"#).expect("off config parses");
         assert!(!config.hybrid_mode);
+    }
+
+    #[test]
+    fn hidpp_battery_events_stay_off_unless_set() {
+        let config: BridgeConfig = serde_json::from_str("{}").expect("empty config parses");
+        assert!(!config.hidpp_battery_events);
+        let config: BridgeConfig =
+            serde_json::from_str(r#"{"hidppBatteryEvents": true}"#).expect("on config parses");
+        assert!(config.hidpp_battery_events);
     }
 
     #[test]

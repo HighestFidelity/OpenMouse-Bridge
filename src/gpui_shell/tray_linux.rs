@@ -524,6 +524,7 @@ mod tests {
             stale: false,
             ink: (242, 184, 75),
             minutes_remaining: Some(90),
+            checked: tray_battery::checked_text(0),
             size: 22,
             style: platform::TrayBatteryStyle::Glyph,
         };
