@@ -409,6 +409,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Pre-release tags (v1.2.0-rc.1) are published as pre-releases and
+          # never marked latest, so the updater's
+          # releases/latest/download/latest.json keeps offering the last
+          # stable release.
+          prerelease="$(node --input-type=module -e '
+            import { isPrerelease } from "./.github/scripts/make-release-files.mjs";
+            console.log(isPrerelease(process.argv[1]));
+          ' "$GITHUB_REF_NAME")"
+          if [ "$prerelease" = true ]; then
+            channel=(--prerelease --latest=false)
+          else
+            channel=(--latest)
+          fi
           # Re-cutting a tag replaces the assets and notes of the existing
           # release instead of deleting it, so the release is never missing.
           if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
@@ -419,6 +432,6 @@ jobs:
               --repo "${{ github.repository }}" \
               --verify-tag \
               --notes-file release/notes.md \
-              --latest \
+              "${channel[@]}" \
               artifacts/* release/latest.json
           fi
