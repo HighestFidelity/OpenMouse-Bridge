@@ -193,3 +193,15 @@ Then F4 design, web app fork work (#74 token, panel UI for F4), batch B + simpli
 At the very end: Victor approves every upstream PR before it is opened; Windows test exe for him.
 - Bridge CI workflow disabled on the fork (side chat, Victor's run-failed mails); verify with box temp/omb-checks.sh only,
   re-enable needs Victor. The failing test is hardened (t3/games-test-kernel merged), so re-enabling should be green [Unverified].
+
+## 2026-11-14 Update (features merged, PR prep)
+- Main 2a2e22c: sync v1.0.1, F1 settings-stick (+panel fix), F2 hid-interface-pick (vendor-page siblings only), F3 battery
+  age + opt-in HID++ events (0x1004/0x1000/0x1001), #120 tray fix, games test fix. Box checks green (325+53+11 on dd316ca).
+- Victor: one Logitech G305 Lightspeed (receiver 046d:c53f), 1 monitor (so #120 is code-verified only).
+- E-Daddy C: was full; Victor OK'd deleting merged worktrees + caches (now 50 GB free). Check PR branches on the box.
+- Upstream PR prepared, NOT opened (Victor approves all at the end): pr/tray-reentrancy 8459565 on upstream 66ba469
+  (box checks green), body reports/upstream-prs/tray-reentrancy.md. Worktree C:\Users\Victo\omb-pr-120.
+- Running: F4.1 remap child (t3/remap-always, worktree .claude/worktrees/agent-a3198531...).
+
+NEXT: merge F4.1 after review, build4 exe, Victor tests on G305 (hidppBatteryEvents on, remap, settings stick). Then
+prepare (not open) PR branches: batch B CI (7-9), simplify S-items, F1/F2/F3 upstream versions. Web app fork work (#74).
