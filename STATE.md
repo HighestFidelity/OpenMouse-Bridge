@@ -174,3 +174,10 @@ temp/omb19-open-prs.py (head prefix is upstream/ there; pr/ now). After upstream
 
 NEXT: watch #116-#119 (temp/omb19-pr-status.py 116 117 118 119). After upstream 1.0.1 (Fri 20:00 UTC) is green: batch B
 (7, 8, 9), fork sync merge on t3/sync-upstream, disable the 2 workflows. Batch C next week (12, 14, 10 alone).
+
+## 2026-11-14 Update (P9-OMB21 overview)
+- Upstream merged #116-#119 (11-13) and shipped v1.0.1 (green). Upstream 22 commits ahead; dry merge conflicts in 15 files.
+- Overview: reports/overview-20261114.md (parts in reports/overview-parts/). New: upstream #120 Windows tray crash,
+  [Inference] re-entrant App borrow from Win32 calls inside cx.update_window (src/gpui_shell/mod.rs:300); fork affected.
+
+NEXT: Victor picks from the overview pop-up (sync, #120, batch B, features F1-F8, cross-repo forks). Then worktree children.
