@@ -17,6 +17,12 @@ concurrency:
 env:
   # Keep in sync with ci.yml and release.yml.
   NATIVE_HID_NODE_VERSION: v24.18.1
+  # Bump together with NATIVE_HID_NODE_VERSION: the SHA-256 of each archive
+  # below, from https://nodejs.org/dist/<version>/SHASUMS256.txt.
+  NATIVE_HID_NODE_SHA256_DARWIN_ARM64: eb02f7fab96d3d67de40c5ec8566096fcb4c2026728787683ae5a97eb612b941
+  NATIVE_HID_NODE_SHA256_DARWIN_X64: 6fb20fceacbb157c2f95825b80df4a454a0f6d81cdcd7bb81eeae9147e0e76ec
+  NATIVE_HID_NODE_SHA256_LINUX_X64: d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0
+  NATIVE_HID_NODE_SHA256_WIN_X64: ec56b84a7551893ab2324ebdfdc4ab974a63b4781162600b68a1293cc3e53765
 
 jobs:
   macos-dmg:
@@ -31,22 +37,22 @@ jobs:
       HAS_MAC_SIGNING: ${{ secrets.MACOS_CERTIFICATE_BASE64 != '' }}
       HAS_MAC_NOTARIZATION: ${{ secrets.MACOS_CERTIFICATE_BASE64 != '' && secrets.APPLE_ID != '' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: gpui-macos
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
-      - uses: actions/cache@v5
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         id: native-hid-cache
         with:
           path: native-hid/node_modules
@@ -63,8 +69,14 @@ jobs:
           # silicon and Intel since the Bridge binary itself is universal.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
             ! -name HID-darwin-arm64 ! -name HID-darwin-x64 -exec rm -rf {} +
-          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz" | tar -xz
-          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz" | tar -xz
+          # Verify each archive against its pinned SHA-256 before extracting.
+          arm64_tar="$RUNNER_TEMP/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz"
+          x64_tar="$RUNNER_TEMP/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 -o "$arm64_tar" "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 -o "$x64_tar" "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz"
+          printf '%s  %s\n' "$NATIVE_HID_NODE_SHA256_DARWIN_ARM64" "$arm64_tar" "$NATIVE_HID_NODE_SHA256_DARWIN_X64" "$x64_tar" | shasum -a 256 -c
+          tar -xzf "$arm64_tar"
+          tar -xzf "$x64_tar"
           mkdir -p native-hid/node/bin
           lipo -create \
             "node-$NATIVE_HID_NODE_VERSION-darwin-arm64/bin/node" \
@@ -122,7 +134,7 @@ jobs:
           set -euo pipefail
           # Homebrew Python is externally managed (PEP 668), so use a venv.
           python3 -m venv "$RUNNER_TEMP/dmgbuild-venv"
-          "$RUNNER_TEMP/dmgbuild-venv/bin/python" -m pip install --quiet dmgbuild
+          "$RUNNER_TEMP/dmgbuild-venv/bin/python" -m pip install --quiet dmgbuild==1.6.7
           export PATH="$RUNNER_TEMP/dmgbuild-venv/bin:$PATH"
           packaging/macos/build-dmg.sh "dist/OpenMouse Bridge.app" OpenMouse-Bridge-macos-universal.dmg
           # Plain Info-ZIP (not ditto): the updater's strict extractor expects ordinary zip entries.
@@ -145,7 +157,7 @@ jobs:
           test -d "$RUNNER_TEMP/dmg/OpenMouse Bridge.app"
           codesign --verify --deep --strict "$RUNNER_TEMP/dmg/OpenMouse Bridge.app"
           hdiutil detach "$RUNNER_TEMP/dmg"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: bridge-macos-dmg
           path: |
@@ -161,7 +173,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       - name: Install build dependencies
@@ -177,18 +189,18 @@ jobs:
             libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev \
             libasound2-dev appstream
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: gpui-linux
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
-      - uses: actions/cache@v5
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         id: native-hid-cache
         with:
           path: native-hid/node_modules
@@ -203,7 +215,11 @@ jobs:
           # Trim node-hid's non-Linux prebuilt bindings.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
             ! -name HID-linux-x64 -exec rm -rf {} +
-          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-linux-x64.tar.xz" | tar -xJ
+          # Verify the archive against its pinned SHA-256 before extracting.
+          node_tar="$RUNNER_TEMP/node-$NATIVE_HID_NODE_VERSION-linux-x64.tar.xz"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 -o "$node_tar" "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-linux-x64.tar.xz"
+          printf '%s  %s\n' "$NATIVE_HID_NODE_SHA256_LINUX_X64" "$node_tar" | sha256sum -c
+          tar -xJf "$node_tar"
           mkdir -p native-hid/node/bin
           cp "node-$NATIVE_HID_NODE_VERSION-linux-x64/bin/node" native-hid/node/bin/node
           chmod +x native-hid/node/bin/node
@@ -270,7 +286,7 @@ jobs:
           test -f squashfs-root/usr/share/applications/io.openmouse.bridge.desktop
           # Every shared library the binary needs must resolve on this machine.
           ! ldd squashfs-root/usr/bin/openmouse-bridge | grep 'not found'
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: bridge-linux-appimage
           path: |
@@ -287,21 +303,21 @@ jobs:
     env:
       HAS_WINDOWS_SIGNING: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: gpui-windows
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
-      - uses: actions/cache@v5
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         id: native-hid-cache
         with:
           path: native-hid/node_modules
@@ -335,6 +351,9 @@ jobs:
             Where-Object { $_.Name -ne 'HID-win32-x64' } |
             Remove-Item -Recurse -Force
           Invoke-WebRequest -Uri "https://nodejs.org/dist/$env:NATIVE_HID_NODE_VERSION/node-$env:NATIVE_HID_NODE_VERSION-win-x64.zip" -OutFile node.zip
+          # Verify the archive against its pinned SHA-256 before extracting.
+          $nodeZipHash = (Get-FileHash node.zip -Algorithm SHA256).Hash
+          if ($nodeZipHash -ne $env:NATIVE_HID_NODE_SHA256_WIN_X64) { throw "node.zip SHA-256 mismatch: got $nodeZipHash" }
           Expand-Archive node.zip -DestinationPath node-extracted
           New-Item -ItemType Directory -Force -Path native-hid/node | Out-Null
           Copy-Item "node-extracted/node-$env:NATIVE_HID_NODE_VERSION-win-x64/node.exe" native-hid/node/node.exe
@@ -376,7 +395,7 @@ jobs:
           }
           $checksum = (Get-FileHash OpenMouse-Bridge-windows-x64-setup.exe -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' + "`n"
           [IO.File]::WriteAllText('OpenMouse-Bridge-windows-x64-setup.exe.sha256', $checksum, [Text.UTF8Encoding]::new($false))
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: bridge-windows
           path: |
