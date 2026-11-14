@@ -581,6 +581,10 @@ struct BridgeState {
     // When the stored settings were last written again to a mouse that woke
     // or came back, per mouse; see `REAPPLY_MIN_INTERVAL`.
     reapplied_at: HashMap<String, Instant>,
+    /// A wake or replug owes one forced write, taken by the next background
+    /// pass; dropped if a panel holds the mouse then, so it never lands on top
+    /// of what the panel changed.
+    wake_reapply: bool,
     // `hid_access::blocked_devices()` as of the last device scan (every
     // `DEVICE_SCAN_INTERVAL`), so a snapshot does not walk sysfs.
     blocked_hid_devices: Vec<String>,
@@ -948,6 +952,7 @@ impl BridgeService {
                 asleep: HashSet::new(),
                 replugged: HashSet::new(),
                 reapplied_at: HashMap::new(),
+                wake_reapply: false,
                 blocked_hid_devices: crate::hid_access::blocked_devices(),
                 active_profile_key: None,
                 applied_profile: None,
@@ -1696,12 +1701,7 @@ impl BridgeService {
                     cause = if woke { "woke" } else { "reconnected" },
                     "mouse came back: reapplying the stored settings"
                 );
-                // No native pass runs while the state lock is held, so this
-                // lock is free.
-                self.native_automation
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .reapply_on_next_reconcile();
+                state.wake_reapply = true;
             }
             // The receiver it came through is not a mouse of its own.
             // Only a row the scan added: a device that was ever read has a
@@ -2186,11 +2186,16 @@ impl BridgeService {
                     .and_then(|(profile, is_default)| {
                         crate::buttons::Assignments::from_profile(profile, is_default)
                     });
+                let wake_reapply = std::mem::take(&mut state.wake_reapply);
                 drop(state);
                 let panel_connected = crate::hid::client_session_active();
                 // A control panel holding the mouse is not interrupted by a new helper.
                 service.buttons.update(desired_buttons, !panel_connected);
-                let outcome = service.reconcile_native().await;
+                let outcome = if forced_wake_pass(wake_reapply, panel_connected) {
+                    service.reconcile_native_forced(true).await
+                } else {
+                    service.reconcile_native().await
+                };
                 if let Some((current, previous, true)) = switch
                     && let Some(message) = switch_message(
                         previous.as_ref(),
@@ -2507,6 +2512,13 @@ fn returned_mice(
 /// written again: Bridge drives it (no control panel connected, onboard
 /// mode), a profile with settings for its brand is in force, and it was not
 /// reapplied within `REAPPLY_MIN_INTERVAL`. Records the time when it says yes.
+/// Whether this background pass forces the write a wake or replug owes. With a
+/// panel holding the mouse the debt is dropped, not kept for when it leaves:
+/// the panel may have changed the mouse in between.
+fn forced_wake_pass(wake_reapply: bool, panel_connected: bool) -> bool {
+    wake_reapply && !panel_connected
+}
+
 fn admit_reapply(state: &mut BridgeState, device_id: &str, now: Instant) -> bool {
     if panel_connected(state) || state.device_mode != DeviceMode::Onboard {
         return false;
@@ -4587,11 +4599,14 @@ mod tests {
     }
 
     fn reapply_owed(bridge: &BridgeService) -> bool {
-        bridge
-            .native_automation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take_reapply_owed()
+        std::mem::take(&mut bridge.inner.try_write().unwrap().wake_reapply)
+    }
+
+    #[test]
+    fn a_panel_holding_the_mouse_drops_the_wake_write() {
+        assert!(forced_wake_pass(true, false));
+        assert!(!forced_wake_pass(true, true), "dropped, not kept for later");
+        assert!(!forced_wake_pass(false, false));
     }
 
     #[test]
