@@ -18,7 +18,9 @@ Branch t3/sync-upstream, merge commit 022f28e (parents 076a8c0, 66ba469). Not pu
 
 ## Port duplicates dropped / kept
 - Iris (#60): dropped fork `undeclared_feature_buffer_len()` helper and its test `undeclared_feature_reads_fall_back_only_for_known_vendors`; upstream 49fa3f8 inline arms are equivalent. 1 unit test fewer.
-- Scyrox (#62): kept the fork port. Upstream 02a2594 imports SCYROX_PRODUCT_IDS from the package and tests only 0xf515/0xf517 waiting for a release with 0xf5f7; v0.58.0 and v0.59.0 both already ship 0xf5f7 (checked via gh api), so ours is ahead.
+- Scyrox (#62): kept the fork port. Its brands.mjs is plain data that loads without the package (test-fakes/register.mjs
+  imports it first); upstream 02a2594 imports SCYROX_PRODUCT_IDS from @openmouse/protocol. Same ids either way (v0.58.0 and
+  v0.59.0 both list 0xf5f7, checked via gh api); our test also covers 0xf5f7. Dropped: upstream's package import and 2-id test.
 
 ## Ours that upstream lacks (all kept)
 Signed update feed, fork update feed, Linux peer-uid gate, Linux blocking HID readers + identity check, workflow hardening, G-Wolves/Redragon ports + classesFor, ideas-runtime/perf/hybrid, bad-config recovery, bridge-server.mjs removal.
@@ -33,8 +35,10 @@ Signed update feed, fork update feed, Linux peer-uid gate, Linux blocking HID re
 - cargo fmt --check: ok.
 - cargo test --locked: 287 + 39 + 11 + 0 pass, 0 fail (3 + 1 ignored).
 - cargo clippy --all-targets --locked -D warnings: clean.
-- node --test .github/scripts/: the directory form fails to load on this Node; glob form: 20 tests, 19 pass, 1 fail. The fail is
-  native-hid-node "every job reads the pins" (2 !== 9): this checkout has CRLF workflows and the test splits on `jobs:\n`.
-  On an LF copy of .github it passes (9 readers). [Inference] same CRLF fail on main in this checkout; CI sees LF.
-- native-hid npm test: 35 tests, 32 pass, 2 fail (baseline attack-shark-x11, automation: need node-hid), 1 skipped.
-- Not run: anything on hardware, workflows on a runner, Linux/macOS builds.
+- node --test .github/scripts/*.test.mjs on the committed tree (git archive, autocrlf off, LF): 20 tests, 20 pass.
+  In this CRLF working copy: 19/20 (native-hid-node test splits jobs on `jobs:\n`, finds 2 readers). Directory form does not load here.
+- native-hid npm test: 35 tests, 32 pass, 2 fail (baseline attack-shark-x11, automation: need node-hid), 1 skipped
+  (brands.test.mjs copy-vs-package check, needs @openmouse/protocol installed). mouse-protocol v0.58.0...v0.59.0 touches
+  no gwolves, redragon or scyrox file (gh api compare, 10 files), so the copied id lists still match.
+- Not run: anything on hardware, workflows on a runner, Linux/macOS builds. Upstream's clean Linux-only merges
+  (overlay/linux.rs Wayland check, tray_linux.rs Toggle, vendored wayland client) are not compiled here.
