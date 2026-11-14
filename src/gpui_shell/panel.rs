@@ -11,7 +11,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use openmouse_bridge::{
-    BRIDGE_PORT, changelog, config, hid_access,
+    BRIDGE_PORT,
+    buttons::{
+        Action,
+        remap::{self, ButtonRemap},
+    },
+    changelog, config, hid_access,
     platform::{self, TrayBatteryStyle},
     service::{BridgeSnapshot, KnownDeviceState, KnownDeviceStatus, Notice},
     updater::{DownloadProgress, UpdateInfo, download_progress},
@@ -146,6 +151,8 @@ pub struct PanelView {
     /// Home's "Updated to …" line was opened or dismissed this session; the
     /// core saves it too, but the snapshot only catches up a second later.
     whats_new_dismissed: bool,
+    /// Bridge's own button assignments as shown; each snapshot overwrites them.
+    button_remap: ButtonRemap,
 }
 
 pub struct Drained {
@@ -375,6 +382,7 @@ impl PanelView {
                 .ok(),
             incoming_notes: None,
             whats_new_dismissed: false,
+            button_remap: ButtonRemap::default(),
         }
     }
 
@@ -410,6 +418,9 @@ impl PanelView {
             self.battery_threshold = snapshot.battery_threshold_percent;
             self.notification_sound = snapshot.notification_sound;
             self.notification_volume = snapshot.notification_volume;
+            // A save that failed shows the saved assignments again.
+            changed |= self.button_remap != snapshot.button_remap;
+            self.button_remap = snapshot.button_remap.clone();
             // A snapshot arrives every second; repaint only when it, or a
             // setting it overrides, would show differently.
             changed |= settings != self.shown_settings()
@@ -623,6 +634,27 @@ impl PanelView {
         self.hybrid_mode = enabled;
         let _ = self.commands.send(BridgeCommand::SetHybridMode(enabled));
         cx.notify();
+    }
+
+    /// Gives one of the side buttons an action of Bridge's lists, or clears it.
+    fn set_remap(&mut self, bit: u8, action: Option<Action>, cx: &mut Context<Self>) {
+        if self.button_remap.set(bit, action).is_ok() {
+            let _ = self
+                .commands
+                .send(BridgeCommand::SetButtonRemap(bit, action));
+            cx.notify();
+        }
+    }
+
+    fn step_remap(&mut self, bit: u8, steps: i32, cx: &mut Context<Self>) {
+        let next = remap::step_choice(self.button_remap.get(bit), steps);
+        self.set_remap(bit, Some(next), cx);
+    }
+
+    fn toggle_remap_modifier(&mut self, bit: u8, modifier: u8, cx: &mut Context<Self>) {
+        if let Some(action) = self.button_remap.get(bit) {
+            self.set_remap(bit, Some(remap::toggle_modifier(action, modifier)), cx);
+        }
     }
 
     fn set_tray_style(&mut self, style: TrayBatteryStyle, cx: &mut Context<Self>) {
@@ -1434,6 +1466,8 @@ impl PanelView {
                     )),
             );
 
+        body = body.child(self.remap_card(muted, line, fill, cx));
+
         let mut updates = card(line, fill)
             .child(
                 div()
@@ -1528,6 +1562,83 @@ impl PanelView {
             body = body.child(div().text_xs().text_color(danger).child(error.clone()));
         }
         content.child(body)
+    }
+
+    /// Bridge's own assignments for the side buttons: the arrows step through
+    /// the allowed actions, a key gets modifier toggles, the cross clears.
+    fn remap_card(&self, muted: Hsla, line: Hsla, fill: Hsla, cx: &mut Context<Self>) -> Div {
+        let mut section = card(line, fill).child(div().text_sm().child("Button assignments"));
+        for button in remap::BUTTONS {
+            let bit = button.bit;
+            let action = self.button_remap.get(bit);
+            let id = |part: &str| SharedString::from(format!("remap-{}-{part}", button.name));
+            let mut rows = div().flex().flex_col().gap_1().child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_sm()
+                    .child(div().w(px(104.)).text_color(muted).child(button.label))
+                    .child(
+                        Button::new(id("previous"))
+                            .ghost()
+                            .compact()
+                            .icon(IconName::ChevronLeft)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.step_remap(bit, -1, cx);
+                            })),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().text_center().child(
+                        action.map_or_else(|| "Normal click".to_owned(), remap::action_label),
+                    ))
+                    .child(
+                        Button::new(id("next"))
+                            .ghost()
+                            .compact()
+                            .icon(IconName::ChevronRight)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.step_remap(bit, 1, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new(id("clear"))
+                            .ghost()
+                            .compact()
+                            .icon(IconName::Close)
+                            .disabled(action.is_none())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_remap(bit, None, cx);
+                            })),
+                    ),
+            );
+            if let Some(Action::Key(key)) = action {
+                let mut modifiers = div().flex().flex_row().gap_1().pl(px(104.));
+                for (name, mask) in remap::MODIFIERS {
+                    let shown = if mask == 0x08 && cfg!(target_os = "macos") {
+                        "Cmd"
+                    } else {
+                        name
+                    };
+                    let toggle = Button::new(id(name)).compact().label(shown);
+                    let toggle = if key.modifiers & mask != 0 {
+                        toggle.primary()
+                    } else {
+                        toggle.ghost()
+                    };
+                    modifiers =
+                        modifiers.child(toggle.on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_remap_modifier(bit, mask, cx)
+                        })));
+                }
+                rows = rows.child(modifiers);
+            }
+            section = section.child(rows);
+        }
+        section.child(div().text_xs().text_color(muted).child(
+            "For a Logitech mouse already in Host mode, whichever game runs. \
+             A game profile's own assignment for a button wins.",
+        ))
     }
 
     /// One of the tray icon's two styles, highlighted while it is the chosen one.

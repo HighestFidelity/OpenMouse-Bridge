@@ -16,16 +16,13 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use super::{Action, BACK, HeldKeys, KeyAction, Step, keymap};
+use super::{Action, BACK, HeldKeys, KeyAction, MouseButton, Step, keymap};
 
 const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
-const BTN_LEFT: u16 = 0x110;
-const BTN_SIDE: u16 = 0x113;
-const BTN_EXTRA: u16 = 0x114;
 const BUS_VIRTUAL: u16 = 0x06;
 /// Keyboard codes the keymap can produce all sit below this.
 const KEY_LIMIT: u16 = 256;
@@ -79,7 +76,14 @@ fn create() -> Result<Devices> {
     let mouse = device(
         "OpenMouse Bridge mouse",
         &[REL_X, REL_Y],
-        [BTN_LEFT, BTN_SIDE, BTN_EXTRA],
+        [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Back,
+            MouseButton::Forward,
+        ]
+        .map(keymap::linux_mouse_button),
     )?;
     thread::sleep(Duration::from_millis(200));
     Ok(Devices {
@@ -148,7 +152,11 @@ pub fn execute(step: Step) {
 }
 
 fn side(bit: u8) -> u16 {
-    if bit == BACK { BTN_SIDE } else { BTN_EXTRA }
+    keymap::linux_mouse_button(if bit == BACK {
+        MouseButton::Back
+    } else {
+        MouseButton::Forward
+    })
 }
 
 /// Modifiers go down before the key and come up after it.
@@ -164,6 +172,19 @@ fn press(devices: &mut Devices, action: Action, down: bool) {
             order
         }
         Action::Media(usage) => keymap::linux_media_key(usage).into_iter().collect(),
+        Action::Mouse(button) => {
+            // A click two held buttons share goes down once and up with the last of them.
+            let code = keymap::linux_mouse_button(button);
+            let changes = if down {
+                devices.held.press(code)
+            } else {
+                devices.held.release(code)
+            };
+            if changes {
+                write_key(&devices.mouse, code, down);
+            }
+            return;
+        }
     };
     if !down {
         order.reverse();

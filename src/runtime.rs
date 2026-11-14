@@ -153,6 +153,8 @@ pub(crate) enum BridgeCommand {
     SetNotificationVolume(u8),
     SetAutomaticUpdates(bool),
     SetHybridMode(bool),
+    /// One of Bridge's own button assignments, by button bit; `None` clears it.
+    SetButtonRemap(u8, Option<openmouse_bridge::buttons::Action>),
     SetTrayBatteryStyle(platform::TrayBatteryStyle),
     CheckForUpdates,
     /// Download and stage an update; it applies on "Restart to update".
@@ -658,6 +660,11 @@ async fn start_background(
                 BridgeCommand::SetHybridMode(enabled) => {
                     if let Err(error) = command_service.set_hybrid_mode(enabled).await {
                         tracing::error!(%error, "could not save Bridge settings");
+                    }
+                }
+                BridgeCommand::SetButtonRemap(bit, action) => {
+                    if let Err(error) = command_service.set_button_remap(bit, action).await {
+                        tracing::error!(%error, "could not save the button assignments");
                     }
                 }
                 BridgeCommand::SetTrayBatteryStyle(style) => {

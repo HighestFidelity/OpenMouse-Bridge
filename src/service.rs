@@ -375,6 +375,21 @@ fn prune_game_images(dir: &Path, keep: &[&str]) {
     }
 }
 
+/// Refuses a profile whose `snapshot.hostButtons` holds anything off Bridge's
+/// allow-list: a web page can send profiles, and those assignments become key
+/// presses. Names the profile, since a save sends every profile at once.
+fn check_host_buttons(profile: &ApplicationProfile) -> Result<()> {
+    crate::buttons::remap::validate_host_buttons(profile.settings.snapshot.as_ref()).map_err(
+        |error| {
+            crate::local_targets::InvalidInput(format!(
+                "profile \"{}\": {error}",
+                profile.application.name
+            ))
+            .into()
+        },
+    )
+}
+
 /// The profile `key` names as it is in the config now, and whether it is the
 /// default profile. A profile keeps its key while its settings are edited, so
 /// the copy Bridge applied earlier can be out of date.
@@ -803,6 +818,8 @@ pub struct BridgeSnapshot {
     pub battery_threshold_percent: u8,
     pub tray_battery_style: String,
     pub hybrid_mode: bool,
+    /// Bridge's own button assignments, as config.json holds them.
+    pub button_remap: crate::buttons::remap::ButtonRemap,
     /// Who drives the mouse right now: `"onboard"` (Bridge applies the
     /// stored settings and reads the battery) or `"live"` (the web panel
     /// holds the HID session).
@@ -1202,6 +1219,7 @@ impl BridgeService {
             battery_threshold_percent: state.config.battery_threshold_percent,
             tray_battery_style: state.config.tray_battery_style.clone(),
             hybrid_mode: state.config.hybrid_mode,
+            button_remap: state.config.button_remap.clone(),
             device_mode: device_mode.as_str().to_owned(),
             autostart_enabled: platform::autostart_enabled(),
             automatic_updates: state.config.automatic_updates,
@@ -1477,6 +1495,9 @@ impl BridgeService {
     }
 
     pub async fn replace_profiles(&self, mut profiles: Vec<ApplicationProfile>) -> Result<()> {
+        for profile in &profiles {
+            check_host_buttons(profile)?;
+        }
         self.update_config(move |config| {
             for profile in &mut profiles {
                 crate::local_targets::canonicalize_profile(profile, &config.local_applications)?;
@@ -1488,6 +1509,7 @@ impl BridgeService {
     }
 
     pub async fn set_default_profile(&self, mut profile: ApplicationProfile) -> Result<()> {
+        check_host_buttons(&profile)?;
         self.update_config(move |config| {
             crate::local_targets::canonicalize_profile(&mut profile, &config.local_applications)?;
             config.default_profile = Some(profile);
@@ -1532,6 +1554,22 @@ impl BridgeService {
         self.set_config_then_save(|config| {
             config.tray_battery_style = style.to_owned();
             *config = config.clone().normalized();
+        })
+        .await
+    }
+
+    /// Gives one of Bridge's own button assignments an action, or clears it.
+    /// Refuses a button or action off `buttons::remap`'s lists.
+    pub async fn set_button_remap(
+        &self,
+        bit: u8,
+        action: Option<crate::buttons::Action>,
+    ) -> Result<()> {
+        self.update_config(|config| {
+            config
+                .button_remap
+                .set(bit, action)
+                .map_err(|error| crate::local_targets::InvalidInput(error).into())
         })
         .await
     }
@@ -2179,13 +2217,12 @@ impl BridgeService {
                 let default = state.config.default_profile.clone();
                 // Read from the config each time: editing the active profile's
                 // keys does not change its key, so the applied copy goes stale.
-                let desired_buttons = state
+                // Bridge's own assignments, with the active profile's on top.
+                let active = state
                     .active_profile_key
                     .as_deref()
-                    .and_then(|key| current_profile(&state.config, key))
-                    .and_then(|(profile, is_default)| {
-                        crate::buttons::Assignments::from_profile(profile, is_default)
-                    });
+                    .and_then(|key| current_profile(&state.config, key));
+                let desired_buttons = crate::buttons::resolve(active, &state.config.button_remap);
                 let wake_reapply = std::mem::take(&mut state.wake_reapply);
                 drop(state);
                 let panel_connected = crate::hid::client_session_active();
