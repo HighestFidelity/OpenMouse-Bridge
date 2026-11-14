@@ -114,6 +114,11 @@ const DEVICE_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// after it wakes: its receiver stays plugged in, so the bus scan cannot tell.
 const ASLEEP_RECHECK: Duration = Duration::from_secs(60);
 
+/// The stored settings are written again to a mouse that woke up or came
+/// back on the bus at most this often, so a flapping mouse or receiver does
+/// not hammer it with writes.
+const REAPPLY_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
 /// A reading this old is shown as stale: more than two missed polls.
 const BATTERY_STALE_AFTER: Duration = Duration::from_secs(12 * 60);
 
@@ -569,6 +574,13 @@ struct BridgeState {
     // Remembered mice whose receiver is plugged in but whose last native read
     // went unanswered: asleep, switched off or out of range.
     asleep: HashSet<String>,
+    // Remembered native mice that came back on the bus (their own device or
+    // their receiver reappeared): the next native read that answers writes
+    // the stored settings again.
+    replugged: HashSet<String>,
+    // When the stored settings were last written again to a mouse that woke
+    // or came back, per mouse; see `REAPPLY_MIN_INTERVAL`.
+    reapplied_at: HashMap<String, Instant>,
     // `hid_access::blocked_devices()` as of the last device scan (every
     // `DEVICE_SCAN_INTERVAL`), so a snapshot does not walk sysfs.
     blocked_hid_devices: Vec<String>,
@@ -875,6 +887,8 @@ impl BridgeService {
                 known,
                 detected: None,
                 asleep: HashSet::new(),
+                replugged: HashSet::new(),
+                reapplied_at: HashMap::new(),
                 blocked_hid_devices: crate::hid_access::blocked_devices(),
                 active_profile_key: None,
                 applied_profile: None,
@@ -1596,7 +1610,27 @@ impl BridgeService {
                 via: reading.via.clone(),
                 native: reading.native,
             };
-            state.asleep.remove(&reading.device_id);
+            // A mouse that slept or was unplugged may have lost the stored
+            // settings (some reset their DPI on wake): owe the next native
+            // pass a write of the profile in force, even if it was applied.
+            let woke = state.asleep.remove(&reading.device_id);
+            let returned = reading.native && state.replugged.remove(&reading.device_id);
+            if reading.native
+                && (woke || returned)
+                && admit_reapply(&mut state, &reading.device_id, Instant::now())
+            {
+                tracing::info!(
+                    device_id = %reading.device_id,
+                    cause = if woke { "woke" } else { "reconnected" },
+                    "mouse came back: reapplying the stored settings"
+                );
+                // No native pass runs while the state lock is held, so this
+                // lock is free.
+                self.native_automation
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .reapply_on_next_reconcile();
+            }
             // The receiver it came through is not a mouse of its own.
             // Only a row the scan added: a device that was ever read has a
             // reading of its own and is not just this mouse's receiver.
@@ -1688,6 +1722,10 @@ impl BridgeService {
                         state.blocked_hid_devices = blocked;
                     }
                     remember_detected(&mut state.known, &detected);
+                    if let Some(before) = previous.as_ref() {
+                        let back = returned_mice(state.known.devices(), before, &ids);
+                        state.replugged.extend(back);
+                    }
                     // A mouse whose receiver left is disconnected, not asleep.
                     let BridgeState { known, asleep, .. } = &mut *state;
                     asleep.retain(|id| {
@@ -2283,6 +2321,53 @@ async fn mark_unanswered(service: &BridgeService, device_id: &str, through: Opti
     }
     let unanswered = unanswered_mice(state.known.devices(), device_id, through);
     state.asleep.extend(unanswered);
+}
+
+/// The remembered native mice that came back on the bus since the last scan:
+/// their own device or the receiver they come through is in `ids` but was not
+/// in `previous`.
+fn returned_mice(
+    known: &[KnownDevice],
+    previous: &HashSet<String>,
+    ids: &HashSet<String>,
+) -> Vec<String> {
+    known
+        .iter()
+        .filter(|device| {
+            device.native
+                && [Some(device.id.as_str()), device.via.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|id| ids.contains(id) && !previous.contains(id))
+        })
+        .map(|device| device.id.clone())
+        .collect()
+}
+
+/// Whether a mouse that just woke or came back gets the stored settings
+/// written again: Bridge drives it (no control panel connected, onboard
+/// mode), a profile with settings for its brand is in force, and it was not
+/// reapplied within `REAPPLY_MIN_INTERVAL`. Records the time when it says yes.
+fn admit_reapply(state: &mut BridgeState, device_id: &str, now: Instant) -> bool {
+    if panel_connected(state) || state.device_mode != DeviceMode::Onboard {
+        return false;
+    }
+    let Some(profile) = state.applied_profile.as_ref() else {
+        return false;
+    };
+    if !brand_of(&profile.device.id).eq_ignore_ascii_case(brand_of(device_id))
+        || (profile.settings.dpi.is_none() && profile.settings.polling_rate_hz.is_none())
+    {
+        return false;
+    }
+    state
+        .reapplied_at
+        .retain(|_, at| now.saturating_duration_since(*at) < REAPPLY_MIN_INTERVAL);
+    if state.reapplied_at.contains_key(device_id) {
+        return false;
+    }
+    state.reapplied_at.insert(device_id.to_owned(), now);
+    true
 }
 
 /// The remembered mice a native read of `device_id` covers, among those
@@ -4199,5 +4284,147 @@ mod tests {
                 ("Delux:M800".to_owned(), "Delux M800".to_owned())
             ]
         );
+    }
+
+    /// Runs `body` on its own runtime while no other test can hold a control
+    /// panel session (`client_session_active` is process-wide).
+    fn serial_native<R>(body: impl std::future::Future<Output = R>) -> R {
+        let _serial = crate::drivers::TEST_NATIVE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(body)
+    }
+
+    const MX: &str = "Logitech:MX Master 3S";
+
+    /// A Bridge driving the MX Master 3S with a 1600 DPI profile in force.
+    async fn driving_mx() -> BridgeService {
+        let bridge = service(BridgeConfig::default());
+        let mut profile = test_profile("Default", "", Some(1600), None);
+        profile.device.id = MX.into();
+        bridge.inner.write().await.applied_profile = Some(profile);
+        bridge
+    }
+
+    fn mx_native_reading() -> BatteryReading {
+        BatteryReading {
+            native: true,
+            ..reading(MX, "MX Master 3S", 80)
+        }
+    }
+
+    fn reapply_owed(bridge: &BridgeService) -> bool {
+        bridge
+            .native_automation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_reapply_owed()
+    }
+
+    #[test]
+    fn a_mouse_waking_owes_one_reapply_within_the_window() {
+        serial_native(async {
+            let bridge = driving_mx().await;
+            bridge.inner.write().await.asleep.insert(MX.into());
+            bridge.record_battery(mx_native_reading()).await.unwrap();
+            assert!(reapply_owed(&bridge), "a wake owes a forced reapply");
+
+            // An answered read of an awake mouse is no wake.
+            bridge.record_battery(mx_native_reading()).await.unwrap();
+            assert!(!reapply_owed(&bridge));
+
+            // It sleeps and wakes again right away: rate limited.
+            bridge.inner.write().await.asleep.insert(MX.into());
+            bridge.record_battery(mx_native_reading()).await.unwrap();
+            assert!(
+                !reapply_owed(&bridge),
+                "a second wake within 10 s is skipped"
+            );
+        });
+    }
+
+    #[test]
+    fn the_reapply_window_is_per_mouse_and_reopens_after_ten_seconds() {
+        serial_native(async {
+            let bridge = driving_mx().await;
+            let mut state = bridge.inner.write().await;
+            let now = Instant::now();
+            assert!(admit_reapply(&mut state, MX, now));
+            assert!(!admit_reapply(&mut state, MX, now + Duration::from_secs(9)));
+            assert!(admit_reapply(&mut state, "Logitech:G Pro", now));
+            assert!(admit_reapply(&mut state, MX, now + REAPPLY_MIN_INTERVAL));
+            // Not a mouse the profile in force is for.
+            assert!(!admit_reapply(&mut state, "Razer:Viper", now));
+        });
+    }
+
+    #[test]
+    fn a_connected_control_panel_suppresses_the_wake_reapply() {
+        serial_native(async {
+            let bridge = driving_mx().await;
+            let session = crate::hid::hold_client_session();
+            bridge.inner.write().await.asleep.insert(MX.into());
+            bridge.record_battery(mx_native_reading()).await.unwrap();
+            drop(session);
+            assert!(!reapply_owed(&bridge), "the panel owns the mouse");
+            assert!(bridge.inner.read().await.reapplied_at.is_empty());
+
+            // Live mode (the panel just left, the mode monitor has not flipped
+            // yet) and a recent panel heartbeat suppress it too.
+            let mut state = bridge.inner.write().await;
+            state.device_mode = DeviceMode::Live;
+            assert!(!admit_reapply(&mut state, MX, Instant::now()));
+            state.device_mode = DeviceMode::Onboard;
+            state.last_client_heartbeat = Some(Instant::now());
+            assert!(!admit_reapply(&mut state, MX, Instant::now()));
+        });
+    }
+
+    #[test]
+    fn only_a_native_read_of_a_woken_mouse_owes_a_reapply() {
+        serial_native(async {
+            let bridge = driving_mx().await;
+            bridge.inner.write().await.asleep.insert(MX.into());
+            // A control panel's `PUT /v1/battery` says nothing Bridge applied.
+            bridge
+                .record_battery(reading(MX, "MX Master 3S", 80))
+                .await
+                .unwrap();
+            assert!(!reapply_owed(&bridge));
+            assert!(bridge.inner.read().await.reapplied_at.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_replugged_receiver_owes_a_reapply_on_the_next_native_read() {
+        serial_native(async {
+            let bridge = driving_mx().await;
+            let dongle = receiver("Logitech:375D35803234", "USB Receiver", 0x046d, 0xc548);
+            let through = BatteryReading {
+                via: Some(dongle.device_id.clone()),
+                ..mx_native_reading()
+            };
+            bridge.record_battery(through.clone()).await.unwrap();
+            assert!(!reapply_owed(&bridge), "a first reading is no reconnect");
+
+            let gone = HashSet::new();
+            let back: HashSet<String> = [dongle.device_id.clone()].into();
+            {
+                let state = bridge.inner.read().await;
+                // Still on the bus: nothing came back.
+                assert!(returned_mice(state.known.devices(), &back, &back).is_empty());
+                assert_eq!(returned_mice(state.known.devices(), &gone, &back), [MX]);
+            }
+            bridge.inner.write().await.replugged.insert(MX.to_owned());
+            bridge.record_battery(through.clone()).await.unwrap();
+            assert!(reapply_owed(&bridge), "a replug owes a forced reapply");
+            assert!(bridge.inner.read().await.replugged.is_empty());
+            bridge.record_battery(through).await.unwrap();
+            assert!(!reapply_owed(&bridge));
+        });
     }
 }
