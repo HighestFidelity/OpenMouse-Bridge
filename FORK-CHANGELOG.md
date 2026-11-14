@@ -92,3 +92,6 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   the mouse at the next pass (was: fired when the panel left, over the panel's changes); feature-report siblings are
   vendor-page interfaces only (N5). Note: hid::tests::concurrent_enumeration_does_not_crash (upstream 404847f) takes
   ~24 s on E-Daddy (72 serial real enumerations), machine-dependent, not a timeout.
+- t3/battery-voltage (F3 follow-up, Victor's G305): the opt-in HID++ listener also handles 0x1001 BATTERY_VOLTAGE
+  (asks 0x1004, 0x1000, 0x1001 in mouse-protocol's order); voltage -> percent via mouse-protocol's curve, flags as
+  mouse-protocol reads them (bit 7 charging, 0x03==2 full, bit 4 slow charge). Windows tests 316+46+11. Untested on a G305.
