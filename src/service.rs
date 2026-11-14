@@ -375,19 +375,21 @@ fn prune_game_images(dir: &Path, keep: &[&str]) {
     }
 }
 
-/// Refuses a profile whose `snapshot.hostButtons` holds anything off Bridge's
-/// allow-list: a web page can send profiles, and those assignments become key
-/// presses. Names the profile, since a save sends every profile at once.
-fn check_host_buttons(profile: &ApplicationProfile) -> Result<()> {
-    crate::buttons::remap::validate_host_buttons(profile.settings.snapshot.as_ref()).map_err(
-        |error| {
-            crate::local_targets::InvalidInput(format!(
-                "profile \"{}\": {error}",
-                profile.application.name
-            ))
-            .into()
-        },
-    )
+/// Logs a profile whose `snapshot.hostButtons` holds anything off Bridge's
+/// allow-list. The save still goes through: the web panel sends every profile
+/// at once and can record keys this OS cannot press, and refusing would lose
+/// the whole save. Nothing off the list is ever pressed:
+/// `Assignments::from_profile` uses the same list when it builds the actions.
+fn check_host_buttons(profile: &ApplicationProfile) {
+    if let Err(error) =
+        crate::buttons::remap::validate_host_buttons(profile.settings.snapshot.as_ref())
+    {
+        tracing::warn!(
+            profile = %profile.application.name,
+            %error,
+            "hostButtons off Bridge's allow-list are ignored"
+        );
+    }
 }
 
 /// The profile `key` names as it is in the config now, and whether it is the
@@ -1496,7 +1498,7 @@ impl BridgeService {
 
     pub async fn replace_profiles(&self, mut profiles: Vec<ApplicationProfile>) -> Result<()> {
         for profile in &profiles {
-            check_host_buttons(profile)?;
+            check_host_buttons(profile);
         }
         self.update_config(move |config| {
             for profile in &mut profiles {
@@ -1509,7 +1511,7 @@ impl BridgeService {
     }
 
     pub async fn set_default_profile(&self, mut profile: ApplicationProfile) -> Result<()> {
-        check_host_buttons(&profile)?;
+        check_host_buttons(&profile);
         self.update_config(move |config| {
             crate::local_targets::canonicalize_profile(&mut profile, &config.local_applications)?;
             config.default_profile = Some(profile);

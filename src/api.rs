@@ -738,11 +738,13 @@ mod tests {
         })
     }
 
-    /// Assignments from a web page become key presses, so anything off
-    /// Bridge's allow-list is refused at the API with the reason, and nothing
-    /// is saved.
+    /// Assignments from a web page become key presses. The panel sends every
+    /// profile at once and may record keys this OS cannot press, so a save
+    /// with entries off Bridge's allow-list still goes through (refusing it
+    /// would lose the whole save); `Assignments::from_profile` never presses
+    /// them.
     #[tokio::test]
-    async fn profiles_with_assignments_off_the_allow_list_are_refused() {
+    async fn profiles_with_assignments_off_the_allow_list_still_save() {
         let (app, dir) = app();
         for buttons in [
             serde_json::json!({"8": {"key": 4, "keys": [5, 6, 7]}}),
@@ -763,13 +765,13 @@ mod tests {
                 .unwrap(),
             )
             .await;
-            let message = String::from_utf8_lossy(&message);
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{buttons}: {message}");
-            assert!(
-                message.contains("profile \"Apex\": hostButtons"),
-                "{message}"
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{buttons}: {}",
+                String::from_utf8_lossy(&message)
             );
-            let (status, message, _) = call(
+            let (status, ..) = call(
                 &app,
                 Method::PUT,
                 "/v1/default-profile",
@@ -777,13 +779,8 @@ mod tests {
                 serde_json::to_vec(&profile_with(buttons.clone())).unwrap(),
             )
             .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{buttons}");
-            assert!(String::from_utf8_lossy(&message).contains("hostButtons"));
+            assert_eq!(status, StatusCode::OK, "{buttons}");
         }
-        let (_, saved, _) = call(&app, Method::GET, "/v1/profiles", "", Vec::new()).await;
-        assert_eq!(saved, b"[]", "nothing was saved");
-        let (_, saved, _) = call(&app, Method::GET, "/v1/default-profile", "", Vec::new()).await;
-        assert_eq!(saved, b"null", "nothing was saved");
 
         let good = profile_with(
             serde_json::json!({"8": {"key": 0x68, "modifiers": 3}, "16": {"consumer": 233}}),
