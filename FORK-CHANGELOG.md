@@ -77,3 +77,9 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   (async_context.rs:178 panic). Windows now plans the placement inside update_window and calls SetWindowPos/ShowWindow/
   SetForegroundWindow after it returns. 4 placement tests (negative-x monitor). Test exe Desktop\openmouse-bridge-tray-fix.exe
   sha256 4a3897d6...00925 (built on the branch). Not run yet: needs Victor's 2-monitor test.
+- t3/hid-interface-pick (F2, P9-OMB23, refs keyboard-protocol #16, Desktop #28, mouse-protocol #99): a feature report no
+  opened path declares also tries other interfaces of the same physical device (vendor/product/serial + container id or
+  USB port, same FIDO/blocked/receiver filters), vendor pages first. Declaring paths still go first and alone. Change:
+  Razer paths returning all zeros now fall through, which reads Razer descriptors on Windows once (upstream ce9046b
+  bounded that enumeration). Device list order unchanged. Linux: box fmt ok, tests 306+46+11, clippy linux + win-gnu
+  clean; Windows 345 pass. Hardware-untested (#16 fixed only if the vendor interface's feature report is unnumbered).
