@@ -25,15 +25,15 @@ jobs:
     timeout-minutes: 60
     # Signing and notarization are automatic when these secrets exist; without
     # them the app is ad-hoc signed.
+    # The flags say whether the secrets exist; the secrets themselves are
+    # passed only to the steps that use them.
     env:
-      MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      HAS_MAC_SIGNING: ${{ secrets.MACOS_CERTIFICATE_BASE64 != '' }}
+      HAS_MAC_NOTARIZATION: ${{ secrets.MACOS_CERTIFICATE_BASE64 != '' && secrets.APPLE_ID != '' }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -79,7 +79,11 @@ jobs:
             -output openmouse-bridge
           chmod +x openmouse-bridge
       - name: Import signing certificate
-        if: env.MACOS_CERTIFICATE_BASE64 != ''
+        if: env.HAS_MAC_SIGNING == 'true'
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           keychain="$RUNNER_TEMP/openmouse-signing.keychain-db"
@@ -89,22 +93,31 @@ jobs:
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
           security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$RUNNER_TEMP/certificate.p12"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
           echo "MACOS_SIGN_IDENTITY=$MACOS_SIGN_IDENTITY" >> "$GITHUB_ENV"
       - name: Build OpenMouse Bridge.app
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           mkdir -p dist
           packaging/macos/build-app.sh openmouse-bridge native-hid "$version" dist
       - name: Notarize app
-        if: env.MACOS_CERTIFICATE_BASE64 != '' && env.APPLE_ID != ''
+        if: env.HAS_MAC_NOTARIZATION == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
           ditto -c -k --keepParent "dist/OpenMouse Bridge.app" notarize-app.zip
           xcrun notarytool submit notarize-app.zip --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
           xcrun stapler staple "dist/OpenMouse Bridge.app"
       - name: Package DMG and app update archive
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           # Homebrew Python is externally managed (PEP 668), so use a venv.
@@ -116,7 +129,11 @@ jobs:
           (cd dist && zip -r -X -q "../openmouse-bridge-macos-app.zip" "OpenMouse Bridge.app")
           shasum -a 256 openmouse-bridge-macos-app.zip > openmouse-bridge-macos-app.zip.sha256
       - name: Notarize DMG
-        if: env.MACOS_CERTIFICATE_BASE64 != '' && env.APPLE_ID != ''
+        if: env.HAS_MAC_NOTARIZATION == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
           xcrun notarytool submit OpenMouse-Bridge-macos-universal.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
@@ -145,6 +162,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Install build dependencies
         # HID (udev), TLS, and what GPUI draws and takes input through
         # (Wayland, X11/XCB, xkbcommon, Vulkan, fontconfig). The Linux tray uses
@@ -263,11 +282,14 @@ jobs:
     name: Windows x64 ZIP and installer
     runs-on: windows-latest
     timeout-minutes: 60
+    # Not secrets: whether the signing secrets exist. The secrets themselves
+    # are passed only to the steps that sign.
     env:
-      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      HAS_WINDOWS_SIGNING: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -289,14 +311,22 @@ jobs:
         run: npm ci --prefix native-hid --omit=dev
       - run: cargo build --release --locked
       - name: Sign executable
-        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        if: env.HAS_WINDOWS_SIGNING == 'true'
         shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
+          # The certificate file is removed before this step ends.
           $certificate = Join-Path $env:RUNNER_TEMP 'openmouse-bridge.pfx'
           [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
-          & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD target/release/openmouse-bridge.exe
-          if ($LASTEXITCODE -ne 0) { throw 'Signing failed' }
+          try {
+            & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD target/release/openmouse-bridge.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Signing failed' }
+          } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $certificate
+          }
       - name: Prepare native-hid (deps + bundled Node.js runtime)
         shell: pwsh
         run: |
@@ -328,13 +358,22 @@ jobs:
         shell: pwsh
         run: ./packaging/windows/build-installer.ps1 -Stage (Join-Path $env:RUNNER_TEMP 'bridge-windows-package') -OutputDirectory .
       - name: Sign Windows installer
-        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        if: env.HAS_WINDOWS_SIGNING == 'true'
         shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
+          # The certificate file is removed before this step ends.
           $certificate = Join-Path $env:RUNNER_TEMP 'openmouse-bridge.pfx'
-          & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD OpenMouse-Bridge-windows-x64-setup.exe
-          if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          try {
+            & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD OpenMouse-Bridge-windows-x64-setup.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
+          } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $certificate
+          }
           $checksum = (Get-FileHash OpenMouse-Bridge-windows-x64-setup.exe -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' + "`n"
           [IO.File]::WriteAllText('OpenMouse-Bridge-windows-x64-setup.exe.sha256', $checksum, [Text.UTF8Encoding]::new($false))
       - uses: actions/upload-artifact@v6

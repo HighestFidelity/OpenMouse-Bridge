@@ -5,15 +5,18 @@ on:
     - cron: '47 9 * * *'
   workflow_dispatch:
 
+# GITHUB_TOKEN only checks out and reads the protocol release. The branch,
+# pull request and merge use PROTOCOL_UPDATE_TOKEN.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   update:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Check automation token
         env:
           PROTOCOL_UPDATE_TOKEN: ${{ secrets.PROTOCOL_UPDATE_TOKEN }}
@@ -56,7 +59,7 @@ jobs:
           pkg.allowScripts[prefix + tag] = true;
           fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
           NODE
-          npm install --prefix native-hid --package-lock-only
+          npm install --prefix native-hid --package-lock-only --ignore-scripts
       - uses: peter-evans/create-pull-request@v7
         id: pr
         with:

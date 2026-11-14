@@ -5,7 +5,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   # The Node.js runtime bundled into native-hid/node/ so Bridge can push
@@ -19,29 +19,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v5
         with:
           node-version: 24
       # Fails in a minute, before an hour of builds, when the tag, Cargo.toml
       # and CHANGELOG.md disagree.
       - name: Verify tag matches Cargo version
-        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "${{ github.ref_name }}"
+        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
       - name: Verify CHANGELOG.md has an entry for this version
         run: |
           node --input-type=module -e '
             import { readFileSync } from "node:fs";
             import { changelogEntry, versionFromTag } from "./.github/scripts/make-release-files.mjs";
             changelogEntry(readFileSync("CHANGELOG.md", "utf8"), versionFromTag(process.argv[1]));
-          ' "${{ github.ref_name }}"
+          ' "$GITHUB_REF_NAME"
   windows:
     name: Windows x64
     needs: preflight
     runs-on: windows-latest
+    # Not secrets: whether the signing secrets exist. The secrets themselves
+    # are passed only to the steps that sign.
     env:
-      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      HAS_WINDOWS_SIGNING: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -60,12 +65,21 @@ jobs:
           npm ci --prefix native-hid
           npm test --prefix native-hid
       - name: Sign executable
-        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        if: env.HAS_WINDOWS_SIGNING == 'true'
         shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
-          $certificate = Join-Path $env:RUNNER_TEMP "openmouse-bridge.pfx"
+          # The certificate file is removed before this step ends.
+          $certificate = Join-Path $env:RUNNER_TEMP 'openmouse-bridge.pfx'
           [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
-          & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD target/release/openmouse-bridge.exe
+          try {
+            & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD target/release/openmouse-bridge.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Signing failed' }
+          } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $certificate
+          }
       - name: Prepare native-hid (deps + bundled Node.js runtime)
         shell: pwsh
         run: |
@@ -109,13 +123,22 @@ jobs:
           Expand-Archive openmouse-bridge-windows-x64-full.zip -DestinationPath $stage
           ./packaging/windows/build-installer.ps1 -Stage $stage -OutputDirectory .
       - name: Sign Windows installer
-        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        if: env.HAS_WINDOWS_SIGNING == 'true'
         shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
+          # The certificate file is removed before this step ends.
           $certificate = Join-Path $env:RUNNER_TEMP 'openmouse-bridge.pfx'
-          & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD OpenMouse-Bridge-windows-x64-setup.exe
-          if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          try {
+            & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD OpenMouse-Bridge-windows-x64-setup.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
+          } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $certificate
+          }
           $checksum = (Get-FileHash OpenMouse-Bridge-windows-x64-setup.exe -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' + "`n"
           [IO.File]::WriteAllText('OpenMouse-Bridge-windows-x64-setup.exe.sha256', $checksum, [Text.UTF8Encoding]::new($false))
       - uses: actions/upload-artifact@v6
@@ -135,15 +158,15 @@ jobs:
     runs-on: macos-15
     # Signing and notarization are automatic when these secrets exist;
     # without them the app is ad-hoc signed.
+    # The flags say whether the secrets exist; the secrets themselves are
+    # passed only to the steps that use them.
     env:
-      MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      HAS_MAC_SIGNING: ${{ secrets.MACOS_CERTIFICATE_BASE64 != '' }}
+      HAS_MAC_NOTARIZATION: ${{ secrets.MACOS_CERTIFICATE_BASE64 != '' && secrets.APPLE_ID != '' }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -195,7 +218,11 @@ jobs:
           packaging/bridge/build-bridge-package.sh openmouse-bridge openmouse-bridge-macos-universal.zip
           shasum -a 256 openmouse-bridge-macos-universal.zip > openmouse-bridge-macos-universal.zip.sha256
       - name: Import signing certificate
-        if: env.MACOS_CERTIFICATE_BASE64 != ''
+        if: env.HAS_MAC_SIGNING == 'true'
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           keychain="$RUNNER_TEMP/openmouse-signing.keychain-db"
@@ -205,22 +232,31 @@ jobs:
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
           security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$RUNNER_TEMP/certificate.p12"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
           echo "MACOS_SIGN_IDENTITY=$MACOS_SIGN_IDENTITY" >> "$GITHUB_ENV"
       - name: Build OpenMouse Bridge.app
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           mkdir -p dist
           packaging/macos/build-app.sh openmouse-bridge native-hid "$version" dist
       - name: Notarize app
-        if: env.MACOS_CERTIFICATE_BASE64 != '' && env.APPLE_ID != ''
+        if: env.HAS_MAC_NOTARIZATION == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
           ditto -c -k --keepParent "dist/OpenMouse Bridge.app" notarize-app.zip
           xcrun notarytool submit notarize-app.zip --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
           xcrun stapler staple "dist/OpenMouse Bridge.app"
       - name: Package DMG and app update archive
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           # Homebrew Python is externally managed (PEP 668), so use a venv.
@@ -232,7 +268,11 @@ jobs:
           (cd dist && zip -r -X -q "../openmouse-bridge-macos-app.zip" "OpenMouse Bridge.app")
           shasum -a 256 openmouse-bridge-macos-app.zip > openmouse-bridge-macos-app.zip.sha256
       - name: Notarize DMG
-        if: env.MACOS_CERTIFICATE_BASE64 != '' && env.APPLE_ID != ''
+        if: env.HAS_MAC_NOTARIZATION == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
           xcrun notarytool submit OpenMouse-Bridge-macos-universal.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
@@ -263,6 +303,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Install Linux HID and GUI dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev appstream
       - uses: dtolnay/rust-toolchain@stable
@@ -386,8 +428,13 @@ jobs:
     name: Publish stable release
     needs: [windows, macos, linux]
     runs-on: ubuntu-latest
+    # Only this job writes: it creates or updates the GitHub release.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -402,7 +449,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir release
-          node .github/scripts/make-release-files.mjs "${{ github.ref_name }}" "${{ github.repository }}" artifacts release
+          node .github/scripts/make-release-files.mjs "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" artifacts release
           cat release/latest.json
       - name: Publish the release
         env:
@@ -411,12 +458,12 @@ jobs:
           set -euo pipefail
           # Re-cutting a tag replaces the assets and notes of the existing
           # release instead of deleting it, so the release is never missing.
-          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" --repo "${{ github.repository }}" --clobber artifacts/* release/latest.json
-            gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release/notes.md
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber artifacts/* release/latest.json
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file release/notes.md
           else
-            gh release create "${{ github.ref_name }}" \
-              --repo "${{ github.repository }}" \
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --notes-file release/notes.md \
               --latest \
