@@ -83,3 +83,8 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   Razer paths returning all zeros now fall through, which reads Razer descriptors on Windows once (upstream ce9046b
   bounded that enumeration). Device list order unchanged. Linux: box fmt ok, tests 306+46+11, clippy linux + win-gnu
   clean; Windows 345 pass. Hardware-untested (#16 fixed only if the vendor interface's feature report is unnumbered).
+- t3/battery-events (F3, P9-OMB24, refs mouse-protocol #170, #79): tray tooltip and panel rows say "checked N min ago"
+  (age of the live battery reading). New src/drivers/hidpp_battery.rs: opt-in (config hidppBatteryEvents: true, default
+  off) listener for unsolicited HID++ 0x1004/0x1000 battery events on one Logitech receiver with one battery mouse;
+  closes within ~250 ms when a panel session starts; 5 min poll stays as fallback. Layouts from mouse-protocol v0.59.0
+  and Linux hid-logitech-hidpp.c, no captures. Two Logitech devices: events dropped, poll only. Hardware-untested.
