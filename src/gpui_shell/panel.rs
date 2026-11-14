@@ -808,37 +808,83 @@ fn format_age(seconds: u64) -> String {
     }
 }
 
-/// Whether `next` would show the same as `shown`. The uptime and "last seen"
-/// clocks tick every second, but the panel shows them to the minute or
-/// coarser, so they count as the same while their text is.
+/// The clocks a snapshot carries that tick every second: uptime, each
+/// remembered mouse's last sighting and battery age, each battery's age.
+#[derive(Default)]
+struct Clocks {
+    uptime: u64,
+    seen: Vec<(u64, Option<u64>)>,
+    checked: Vec<u64>,
+}
+
+impl Clocks {
+    /// Moves `snapshot`'s clocks into `self` and puts `self`'s in their place.
+    fn swap(&mut self, snapshot: &mut BridgeSnapshot) {
+        std::mem::swap(&mut self.uptime, &mut snapshot.uptime_seconds);
+        for (device, (seen, checked)) in snapshot.known_devices.iter_mut().zip(&mut self.seen) {
+            std::mem::swap(&mut device.last_seen_seconds_ago, seen);
+            std::mem::swap(&mut device.battery_checked_seconds_ago, checked);
+        }
+        for (battery, checked) in snapshot.batteries.iter_mut().zip(&mut self.checked) {
+            std::mem::swap(&mut battery.checked_seconds_ago, checked);
+        }
+    }
+
+    fn of(snapshot: &BridgeSnapshot) -> Self {
+        Self {
+            uptime: snapshot.uptime_seconds,
+            seen: snapshot
+                .known_devices
+                .iter()
+                .map(|device| {
+                    (
+                        device.last_seen_seconds_ago,
+                        device.battery_checked_seconds_ago,
+                    )
+                })
+                .collect(),
+            checked: snapshot
+                .batteries
+                .iter()
+                .map(|battery| battery.checked_seconds_ago)
+                .collect(),
+        }
+    }
+}
+
+/// Whether `next` would show the same as `shown`. The uptime, "last seen" and
+/// "checked" clocks tick every second, but the panel shows them to the minute
+/// or coarser, so they count as the same while their text is.
 fn shows_the_same(shown: &BridgeSnapshot, next: &mut BridgeSnapshot) -> bool {
+    let checked_text = |seconds: Option<u64>| seconds.map(crate::tray_battery::checked_text);
     if format_uptime(shown.uptime_seconds) != format_uptime(next.uptime_seconds)
         || shown.known_devices.len() != next.known_devices.len()
+        || shown.batteries.len() != next.batteries.len()
         || shown
             .known_devices
             .iter()
             .zip(&next.known_devices)
             .any(|(shown, next)| {
                 format_age(shown.last_seen_seconds_ago) != format_age(next.last_seen_seconds_ago)
+                    || checked_text(shown.battery_checked_seconds_ago)
+                        != checked_text(next.battery_checked_seconds_ago)
+            })
+        || shown
+            .batteries
+            .iter()
+            .zip(&next.batteries)
+            .any(|(shown, next)| {
+                checked_text(Some(shown.checked_seconds_ago))
+                    != checked_text(Some(next.checked_seconds_ago))
             })
     {
         return false;
     }
     // Compare the rest with the clocks set equal, then put them back.
-    let uptime = std::mem::replace(&mut next.uptime_seconds, shown.uptime_seconds);
-    let ages: Vec<u64> = next
-        .known_devices
-        .iter_mut()
-        .zip(&shown.known_devices)
-        .map(|(next, shown)| {
-            std::mem::replace(&mut next.last_seen_seconds_ago, shown.last_seen_seconds_ago)
-        })
-        .collect();
+    let mut clocks = Clocks::of(shown);
+    clocks.swap(next);
     let same = shown == next;
-    next.uptime_seconds = uptime;
-    for (device, age) in next.known_devices.iter_mut().zip(ages) {
-        device.last_seen_seconds_ago = age;
-    }
+    clocks.swap(next);
     same
 }
 
@@ -886,6 +932,13 @@ fn known_device_text(device: &KnownDeviceStatus) -> String {
         if let Some(percent) = device.percent {
             parts.push(format!("{percent}%"));
         }
+    }
+    // How old the battery figure is, while Bridge holds a live reading. A bus
+    // scan keeps "last seen" fresh, so that alone would hide a stale level.
+    if device.percent.is_some()
+        && let Some(seconds) = device.battery_checked_seconds_ago
+    {
+        parts.push(crate::tray_battery::checked_text(seconds));
     }
     parts.join(" · ")
 }
@@ -1680,7 +1733,9 @@ impl Render for PanelView {
 mod tests {
     // Not `use super::*`: that pulls in GPUI's own `test` macro, which shadows
     // `#[test]`.
-    use super::{UpdateState, offered_notes, shows_the_same, step_threshold, step_volume};
+    use super::{
+        UpdateState, known_device_text, offered_notes, shows_the_same, step_threshold, step_volume,
+    };
     use crate::runtime::UpdateEvent;
     use openmouse_bridge::service::{KnownDeviceState, KnownDeviceStatus};
 
@@ -1692,6 +1747,7 @@ mod tests {
             connected: false,
             state: KnownDeviceState::Disconnected,
             last_seen_seconds_ago: seconds_ago,
+            battery_checked_seconds_ago: None,
             percent: Some(40),
             charging: None,
             dpi: None,
@@ -1722,6 +1778,40 @@ mod tests {
         next.hybrid_mode = true;
         next.known_devices.clear();
         assert!(!shows_the_same(&shown, &mut next));
+    }
+
+    #[test]
+    fn the_battery_age_repaints_once_a_minute() {
+        let device = |checked| KnownDeviceStatus {
+            id: "Logitech:x".into(),
+            name: "PRO X".into(),
+            connected: true,
+            state: KnownDeviceState::Connected,
+            last_seen_seconds_ago: 3,
+            battery_checked_seconds_ago: checked,
+            percent: Some(69),
+            charging: Some(false),
+            dpi: None,
+            polling_rate_hz: None,
+            switch_mode: None,
+        };
+        let mut shown = crate::gpui_shell::test_snapshot();
+        shown.known_devices = vec![device(Some(130))];
+        let mut next = crate::gpui_shell::test_snapshot();
+        next.known_devices = vec![device(Some(170))];
+        assert!(shows_the_same(&shown, &mut next), "still 2 min");
+        assert_eq!(next.known_devices[0].battery_checked_seconds_ago, Some(170));
+        next.known_devices[0].battery_checked_seconds_ago = Some(180);
+        assert!(!shows_the_same(&shown, &mut next), "3 min now");
+
+        assert_eq!(
+            known_device_text(&device(Some(180))),
+            "69% · checked 3 min ago"
+        );
+        assert_eq!(known_device_text(&device(None)), "69%", "after a restart");
+        let mut no_battery = device(Some(5));
+        no_battery.percent = None;
+        assert_eq!(known_device_text(&no_battery), "Connected");
     }
 
     #[test]

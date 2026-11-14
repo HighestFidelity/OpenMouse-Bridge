@@ -690,6 +690,9 @@ pub struct DeviceBattery {
     /// from the recent trend; `None` while there is no confident estimate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub minutes_remaining: Option<u32>,
+    /// Seconds since this reading arrived (a poll, a battery event or a
+    /// control panel's report), so the tray can say how old it is.
+    pub checked_seconds_ago: u64,
     /// The settings currently in the mouse's onboard memory, from the most
     /// recent native status read; `None` when unreadable.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -772,7 +775,13 @@ pub struct KnownDeviceStatus {
     /// `state` is `Connected`.
     pub connected: bool,
     pub state: KnownDeviceState,
+    /// When the receiver or mouse was last on the bus. A bus scan refreshes
+    /// it, so it says nothing about how old `percent` is.
     pub last_seen_seconds_ago: u64,
+    /// Seconds since the battery was last read, while Bridge holds a live
+    /// reading for this mouse; `None` after a restart until the next read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery_checked_seconds_ago: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub percent: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1014,6 +1023,7 @@ impl BridgeService {
                     } else {
                         estimate_minutes_remaining(&entry.history, entry.percent, entry.charging)
                     },
+                    checked_seconds_ago: entry.updated_at.elapsed().as_secs(),
                     dpi: entry.dpi,
                     polling_rate_hz: entry.polling_rate_hz,
                     switch_mode: entry.switch_mode.clone(),
@@ -1037,6 +1047,7 @@ impl BridgeService {
             .filter(|device| !is_receiver_of_another(state.known.devices(), device))
             .map(|device| {
                 let age = now.saturating_sub(device.last_seen);
+                let state_battery = &state.battery;
                 let state = known_device_state(
                     device,
                     age,
@@ -1050,6 +1061,9 @@ impl BridgeService {
                     connected: state == KnownDeviceState::Connected,
                     state,
                     last_seen_seconds_ago: age,
+                    battery_checked_seconds_ago: state_battery
+                        .get(&device.id)
+                        .map(|entry| entry.updated_at.elapsed().as_secs()),
                     percent: device.percent,
                     charging: device.charging,
                     dpi: device.dpi,

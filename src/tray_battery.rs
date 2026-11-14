@@ -31,6 +31,10 @@ pub struct TrayBattery {
     /// threshold, gray when the reading is stale.
     pub ink: (u8, u8, u8),
     pub minutes_remaining: Option<u32>,
+    /// How old the reading is, as the tooltip words it ("checked 3 min
+    /// ago"). Text, not seconds, so the icon is redrawn once a minute at
+    /// most instead of on every snapshot.
+    pub checked: String,
     /// The icon's side in pixels.
     pub size: u32,
     /// The battery glyph or the percentage number.
@@ -89,6 +93,7 @@ pub fn from_snapshot(snapshot: Option<&BridgeSnapshot>) -> Option<TrayBattery> {
             snapshot.battery_threshold_percent,
         ),
         minutes_remaining: battery.minutes_remaining,
+        checked: checked_text(battery.checked_seconds_ago),
         size: icon_size(),
         style: TrayBatteryStyle::from_config_str(&snapshot.tray_battery_style),
     })
@@ -107,7 +112,19 @@ pub fn remaining_text(minutes: u32) -> String {
     }
 }
 
-/// `Device — 87% · Charging · full in 45 m`.
+/// How long ago a battery was last read, to the minute: `checked just now`,
+/// `checked 3 min ago`, `checked 2 h ago`, `checked 1 d ago`.
+pub fn checked_text(seconds: u64) -> String {
+    match seconds {
+        0..=59 => "checked just now".into(),
+        60..=3_599 => format!("checked {} min ago", seconds / 60),
+        3_600..=86_399 => format!("checked {} h ago", seconds / 3_600),
+        _ => format!("checked {} d ago", seconds / 86_400),
+    }
+}
+
+/// `Device — 87% · Charging · full in 45 m · checked 3 min ago`. The age
+/// goes last, so a long name cuts it before the charge level.
 pub fn tooltip(battery: &TrayBattery) -> String {
     let status = match (battery.charging, battery.stale) {
         (true, _) => " · Charging",
@@ -123,10 +140,13 @@ pub fn tooltip(battery: &TrayBattery) -> String {
     });
     let text = match estimate {
         Some(estimate) => format!(
-            "{} — {}%{status} · {estimate}",
-            battery.device_name, battery.percent
+            "{} — {}%{status} · {estimate} · {}",
+            battery.device_name, battery.percent, battery.checked
         ),
-        None => format!("{} — {}%{status}", battery.device_name, battery.percent),
+        None => format!(
+            "{} — {}%{status} · {}",
+            battery.device_name, battery.percent, battery.checked
+        ),
     };
     text.chars().take(TOOLTIP_CHARS).collect()
 }
@@ -155,6 +175,7 @@ mod tests {
             charging,
             stale,
             minutes_remaining: None,
+            checked_seconds_ago: 0,
             dpi: None,
             polling_rate_hz: None,
             switch_mode: None,
@@ -169,6 +190,7 @@ mod tests {
             stale,
             ink: ink(percent, charging, stale, 20),
             minutes_remaining: minutes,
+            checked: checked_text(0),
             size: 22,
             style: TrayBatteryStyle::Glyph,
         }
@@ -201,19 +223,56 @@ mod tests {
 
     #[test]
     fn the_tooltip_spells_out_the_state() {
-        assert_eq!(tooltip(&tray(87, false, false, None)), "Mouse — 87%");
+        assert_eq!(
+            tooltip(&tray(87, false, false, None)),
+            "Mouse — 87% · checked just now"
+        );
         assert_eq!(
             tooltip(&tray(87, true, false, Some(45))),
-            "Mouse — 87% · Charging · full in 45 m"
+            "Mouse — 87% · Charging · full in 45 m · checked just now"
         );
         assert_eq!(
             tooltip(&tray(40, false, false, Some(150))),
-            "Mouse — 40% · 2 h 30 m left"
+            "Mouse — 40% · 2 h 30 m left · checked just now"
         );
+        let mut stale = tray(40, false, true, None);
+        stale.checked = checked_text(15 * 60);
         assert_eq!(
-            tooltip(&tray(40, false, true, None)),
-            "Mouse — 40% · Not updating"
+            tooltip(&stale),
+            "Mouse — 40% · Not updating · checked 15 min ago"
         );
+    }
+
+    #[test]
+    fn the_reading_age_reads_to_the_minute() {
+        assert_eq!(checked_text(0), "checked just now");
+        assert_eq!(checked_text(59), "checked just now");
+        assert_eq!(checked_text(60), "checked 1 min ago");
+        assert_eq!(checked_text(3 * 60 + 59), "checked 3 min ago");
+        assert_eq!(checked_text(3_599), "checked 59 min ago");
+        assert_eq!(checked_text(3_600), "checked 1 h ago");
+        assert_eq!(checked_text(86_399), "checked 23 h ago");
+        assert_eq!(checked_text(86_400), "checked 1 d ago");
+    }
+
+    #[test]
+    fn the_age_changes_the_tray_only_once_a_minute() {
+        let mut snapshot = crate::gpui_shell::test_snapshot();
+        let mut reading = battery("Mouse", 60, false, false);
+        reading.checked_seconds_ago = 61;
+        snapshot.batteries = vec![reading.clone()];
+        let first = from_snapshot(Some(&snapshot)).unwrap();
+        assert_eq!(first.checked, "checked 1 min ago");
+        reading.checked_seconds_ago = 119;
+        snapshot.batteries = vec![reading.clone()];
+        assert_eq!(
+            from_snapshot(Some(&snapshot)).unwrap(),
+            first,
+            "same minute"
+        );
+        reading.checked_seconds_ago = 120;
+        snapshot.batteries = vec![reading];
+        assert_ne!(from_snapshot(Some(&snapshot)).unwrap(), first);
     }
 
     #[test]
