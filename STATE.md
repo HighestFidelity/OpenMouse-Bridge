@@ -181,3 +181,13 @@ NEXT: watch #116-#119 (temp/omb19-pr-status.py 116 117 118 119). After upstream 
   [Inference] re-entrant App borrow from Win32 calls inside cx.update_window (src/gpui_shell/mod.rs:300); fork affected.
 
 NEXT: Victor picks from the overview pop-up (sync, #120, batch B, features F1-F8, cross-repo forks). Then worktree children.
+- Victor's picks (11-14, APPROVALS): F1-F4 into the fork, forks of openmouse + mouse-protocol (created: HighestFidelity/openmouse,
+  HighestFidelity/mouse-protocol), "do whatever you want but do not push any pr until i approve them at the very end".
+- Synced: main 7ff47d3 = upstream v1.0.1 merged (P9-OMB26 done-ready). Fork workflows update-keyboard-protocol + weekly-release disabled.
+- PC worktree children running (.claude/worktrees/agent-*): t3/settings-stick (F1), t3/hid-interface-pick (F2),
+  t3/battery-events (F3), t3/tray-reentrancy (#120: root cause confirmed, SetWindowPos -> WM_MOVE -> display-changed
+  callback AsyncApp::update while update_window holds App). F4 not started (large, needs UI).
+
+NEXT: review + merge each child branch --no-ff, Linux checks on box (temp/omb-checks.sh on a fresh clone), FORK-CHANGELOG.
+Then F4 design, web app fork work (#74 token, panel UI for F4), batch B + simplify branches prepared but NOT opened.
+At the very end: Victor approves every upstream PR before it is opened; Windows test exe for him.
