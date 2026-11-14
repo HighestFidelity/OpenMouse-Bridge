@@ -1,0 +1,77 @@
+name: Update keyboard protocol
+
+on:
+  schedule:
+    - cron: '47 9 * * *'
+  workflow_dispatch:
+
+# GITHUB_TOKEN only checks out and reads the protocol release; the branch and
+# pull request use PROTOCOL_UPDATE_TOKEN. A maintainer reviews and merges the
+# PR: new protocol code ships signed with HID access, so it never auto-merges.
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Check automation token
+        env:
+          PROTOCOL_UPDATE_TOKEN: ${{ secrets.PROTOCOL_UPDATE_TOKEN }}
+        run: |
+          if [ -z "$PROTOCOL_UPDATE_TOKEN" ]; then
+            echo 'Set the PROTOCOL_UPDATE_TOKEN repository secret to a scoped GitHub App or personal token.' >&2
+            exit 1
+          fi
+      - name: Read the pinned Node.js runtime
+        id: native-hid-node
+        run: node .github/scripts/native-hid-node.mjs
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ steps.native-hid-node.outputs.version }}
+          cache: npm
+          cache-dependency-path: native-hid/package-lock.json
+      - name: Find newest protocol release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh api repos/OpenMouse-Project/keyboard-protocol/releases/latest --jq .tag_name)"
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Update pinned protocol and lockfile
+        env:
+          PROTOCOL_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = 'native-hid/package.json';
+          const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+          const tag = process.env.PROTOCOL_TAG;
+          if (!/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(tag)) {
+            throw new Error(`Unexpected protocol tag: ${tag}`);
+          }
+          const prefix = 'github:OpenMouse-Project/keyboard-protocol#';
+          if (pkg.dependencies['@openmouse/keyboard-protocol'] === prefix + tag) process.exit(0);
+          pkg.dependencies['@openmouse/keyboard-protocol'] = prefix + tag;
+          for (const key of Object.keys(pkg.allowScripts ?? {})) {
+            if (key.startsWith(prefix + 'v')) delete pkg.allowScripts[key];
+          }
+          pkg.allowScripts[prefix + tag] = true;
+          fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          NODE
+          npm install --prefix native-hid --package-lock-only --ignore-scripts
+      - uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          token: ${{ secrets.PROTOCOL_UPDATE_TOKEN }}
+          branch: automation/update-keyboard-protocol
+          delete-branch: true
+          title: 'chore: update keyboard protocol to ${{ steps.release.outputs.tag }}'
+          body: 'Updates the bundled keyboard protocol. Review the protocol diff and merge by hand once the macOS, Windows, and Linux checks pass; it does not merge automatically.'
+          commit-message: 'chore: update keyboard protocol to ${{ steps.release.outputs.tag }}'
+          add-paths: |
+            native-hid/package.json
+            native-hid/package-lock.json

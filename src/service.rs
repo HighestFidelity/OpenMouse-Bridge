@@ -2131,7 +2131,7 @@ fn remember_detected(known: &mut DeviceStore, discovered: &[drivers::DetectedMou
 
 /// Whether a device scan should read the batteries now: a mouse appeared on
 /// the bus since the last scan, or, on the first scan, a mouse is on the bus
-/// but the startup poll left no reading (upstream #79).
+/// but the startup poll left no reading (#79).
 fn scan_wants_read(
     previous: Option<&HashSet<String>>,
     ids: &HashSet<String>,
@@ -3467,7 +3467,7 @@ mod tests {
     fn the_first_scan_reads_a_mouse_already_on_the_bus_when_no_reading_landed() {
         let ids: HashSet<String> = ["Logitech:046d:c547".to_string()].into();
         let none = HashSet::new();
-        // Upstream #79: the dongle is on the bus at the first scan but the
+        // #79: the dongle is on the bus at the first scan but the
         // startup poll got nothing, so the tray stayed blank for 5 minutes.
         assert!(scan_wants_read(None, &ids, false));
         assert!(!scan_wants_read(None, &ids, true));

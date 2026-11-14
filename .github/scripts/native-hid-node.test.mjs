@@ -102,7 +102,7 @@ test("every job that uses the pins reads them first and runs that Node.js", () =
     const firstUse = text.indexOf("NATIVE_HID_NODE_");
     assert.ok(firstUse === -1 || firstUse > readAt, `${where} uses the pins before reading them`);
   }
-  // ci.yml, update-mouse-protocol.yml, and the three build jobs each in
-  // gpui-build.yml and release.yml.
-  assert.equal(readers, 8);
+  // ci.yml, update-mouse-protocol.yml, update-keyboard-protocol.yml, and the
+  // three build jobs each in gpui-build.yml and release.yml.
+  assert.equal(readers, 9);
 });
