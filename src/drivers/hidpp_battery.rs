@@ -516,15 +516,13 @@ pub fn spawn(
                     continue;
                 }
                 next_attempt = Instant::now() + RETRY_AFTER_NOTHING;
+                let mut chosen = None;
+                // Leaving the loop drops every other link, so only the
+                // receiver listened to stays open.
                 for (id, mut link) in open_logitech() {
                     match resolve(&mut link, &gate) {
                         Ok(binding) => {
-                            tracing::info!(device = %id, ?binding, "listening for HID++ battery events");
-                            let ended = listen(link, binding, &gate, &stop, |event| {
-                                on_event(&id, event)
-                            });
-                            tracing::info!(device = %id, ?ended, "stopped listening for HID++ battery events");
-                            next_attempt = Instant::now() + RETRY_AFTER_RELEASE;
+                            chosen = Some((id, link, binding));
                             break;
                         }
                         Err(Unbound::Busy) => {
@@ -536,6 +534,13 @@ pub fn spawn(
                         }
                     }
                 }
+                let Some((id, link, binding)) = chosen else {
+                    continue;
+                };
+                tracing::info!(device = %id, ?binding, "listening for HID++ battery events");
+                let ended = listen(link, binding, &gate, &stop, |event| on_event(&id, event));
+                tracing::info!(device = %id, ?ended, "stopped listening for HID++ battery events");
+                next_attempt = Instant::now() + RETRY_AFTER_RELEASE;
             }
         })
 }
