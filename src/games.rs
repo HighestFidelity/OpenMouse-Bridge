@@ -509,7 +509,9 @@ mod tests {
                 .system
                 .processes()
                 .values()
-                .all(|process| process.thread_kind().is_none())
+                // Kernel threads (a full Linux VM lists them; containers don't)
+                // are processes of their own; only userland threads are tasks.
+                .all(|process| process.thread_kind() != Some(sysinfo::ThreadKind::Userland))
         );
         let path = std::env::current_exe().unwrap();
         let mine: Vec<_> = detector
