@@ -89,6 +89,9 @@ impl BatteryFeature {
 
     fn decode_state(self, status: u8) -> ChargeState {
         match (self, status) {
+            // First: 0x1001's byte is a flag set, not an enum (0x01 is not
+            // charging there).
+            (Self::Voltage, flags) => decode_voltage_flags(flags),
             (_, 0x00) => ChargeState::Discharging,
             (_, 0x01) => ChargeState::Charging,
             (Self::Unified, 0x02) => ChargeState::ChargingSlowly,
@@ -96,7 +99,6 @@ impl BatteryFeature {
             (Self::LevelStatus, 0x02) => ChargeState::AlmostFull,
             (Self::LevelStatus, 0x03) => ChargeState::Full,
             (Self::LevelStatus, 0x04) => ChargeState::ChargingSlowly,
-            (Self::Voltage, flags) => decode_voltage_flags(flags),
             // 0x1004: 4 is a charging fault; 0x1000: 5..7 are battery errors.
             _ => ChargeState::Unknown,
         }
@@ -740,7 +742,7 @@ mod tests {
         assert_eq!(voltage_percent(u16::MAX), 100);
         assert_eq!(voltage_percent(3499), 0);
         assert_eq!(voltage_percent(1), 0);
-        // Linear between points: 20 + 10 * 29 / 46 = 16.3 -> 16.
+        // Linear between points: 10 + 10 * 29 / 46 = 16.3 -> 16.
         assert_eq!(voltage_percent(3700), 16);
         // 80 + 10 * 11 / 78 = 81.4 -> 81.
         assert_eq!(voltage_percent(4000), 81);
@@ -767,6 +769,10 @@ mod tests {
         // The kernel reads 0x81 as full; mouse-protocol as charging.
         assert_eq!(at(3898, 0x81), event(66, true));
         assert_eq!(at(3898, 0x02), event(66, false), "full bits without bit 7");
+        // Without bit 7 or bit 4 every other bit is discharging, 0x01 too.
+        for flags in (0..=0xffu8).filter(|flags| flags & 0x90 == 0) {
+            assert_eq!(at(3898, flags), event(66, false), "{flags:#04x}");
+        }
         assert_eq!(at(3400, 0x00), event(0, false), "flat is a real 0%");
         assert_eq!(at(0, 0x00), None, "no voltage, no reading");
         // The high byte (0x0F) is never taken for a percent.
