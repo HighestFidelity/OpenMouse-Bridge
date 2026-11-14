@@ -191,3 +191,5 @@ NEXT: Victor picks from the overview pop-up (sync, #120, batch B, features F1-F8
 NEXT: review + merge each child branch --no-ff, Linux checks on box (temp/omb-checks.sh on a fresh clone), FORK-CHANGELOG.
 Then F4 design, web app fork work (#74 token, panel UI for F4), batch B + simplify branches prepared but NOT opened.
 At the very end: Victor approves every upstream PR before it is opened; Windows test exe for him.
+- Bridge CI workflow disabled on the fork (side chat, Victor's run-failed mails); verify with box temp/omb-checks.sh only,
+  re-enable needs Victor. The failing test is hardened (t3/games-test-kernel merged), so re-enabling should be green [Unverified].

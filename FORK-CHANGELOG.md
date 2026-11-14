@@ -64,3 +64,7 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   (nothing loads it). Fork hardening kept; upstream's update-keyboard-protocol.yml and weekly-release.yml SHA-pinned.
   Checks: Linux fmt ok, cargo test 298+46+11, clippy clean linux + windows-gnu, scripts 20/20; Windows tests 287+39+11.
   Report: reports/sync-upstream-20261114.md.
+- t3/games-test-kernel: games::one_scan_lists_processes_without_their_threads (fork-only test) failed on GitHub's
+  ubuntu-latest on every push since 11-13. [Inference] a full VM lists kernel threads (thread_kind Some(Kernel)); the box
+  container hides them (0 there). Test now rejects only userland threads. Box: test ok, clippy clean. Not run on a VM.
+- Bridge CI workflow (414290262) disabled on the fork 11-14 (Victor got run-failed mails). Re-enable only on his yes.
