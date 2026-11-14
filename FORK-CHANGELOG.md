@@ -95,3 +95,9 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
 - t3/battery-voltage (F3 follow-up, Victor's G305): the opt-in HID++ listener also handles 0x1001 BATTERY_VOLTAGE
   (asks 0x1004, 0x1000, 0x1001 in mouse-protocol's order); voltage -> percent via mouse-protocol's curve, flags as
   mouse-protocol reads them (bit 7 charging, 0x03==2 full, bit 4 slow charge). Windows tests 316+46+11. Untested on a G305.
+- t3/remap-always (F4.1, P9-OMB25, refs openmouse #272): Bridge-level `buttonRemap` (config.json, empty = old behaviour)
+  for Back/Forward in Host mode, no game needed: one key from a fixed 89-key list + Ctrl/Shift/Alt/Win, one of 7 media
+  keys, or a mouse click; a game profile's assignment wins per button. Editor in the panel's Settings (never rendered).
+  Only the panel writes buttonRemap; hostButtons off the allow-list are logged and never pressed (coordinator changed the
+  child's 400 so a web panel save is never lost). Does not switch a mouse to Host. Box 338+53+11, clippy clean.
+  Gestures (F4.2) need a real MX mouse capture.
