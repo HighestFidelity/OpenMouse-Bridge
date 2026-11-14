@@ -629,6 +629,53 @@ pub struct BatteryReading {
     /// Bridge read the mouse itself, rather than a control panel reporting it.
     #[serde(skip)]
     pub native: bool,
+    /// What this reading does to the remembered HID++ battery event.
+    #[serde(skip)]
+    pub anchor: EventAnchor,
+}
+
+/// What a reading does to the last HID++ battery event kept for its mouse,
+/// which a later poll is checked against (see [`reconcile_poll`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EventAnchor {
+    /// The reading moves the anchor on: a panel report, or a poll that went
+    /// past the event.
+    #[default]
+    Clear,
+    /// A poll that lagged behind the event, which still stands.
+    Keep,
+    /// The reading is a battery event.
+    Set,
+}
+
+/// How long a HID++ battery event can overrule a lagging poll.
+const BATTERY_EVENT_TRUST: Duration = Duration::from_secs(15 * 60);
+
+/// A polled level against the last battery event `(age, percent, charging)`.
+/// mouse-protocol #170 saw polls repeat a stale level while the event had
+/// moved on, so a recent event in the same charge state that is further
+/// along (lower while discharging, higher while charging) wins. Anything
+/// else, a change of state or a poll further along, is the poll's: it can
+/// correct the event too. Returns the level to record and its anchor.
+fn reconcile_poll(
+    percent: u8,
+    charging: bool,
+    event: Option<(Duration, u8, bool)>,
+) -> (u8, bool, EventAnchor) {
+    match event {
+        Some((age, event_percent, event_charging))
+            if age < BATTERY_EVENT_TRUST
+                && event_charging == charging
+                && if charging {
+                    event_percent > percent
+                } else {
+                    event_percent < percent
+                } =>
+        {
+            (event_percent, event_charging, EventAnchor::Keep)
+        }
+        _ => (percent, charging, EventAnchor::Clear),
+    }
 }
 
 struct BatteryState {
@@ -643,6 +690,9 @@ struct BatteryState {
     // Recent (reading time, percent) samples, oldest first, for the tray
     // tooltip's time-remaining estimate.
     history: VecDeque<(Instant, u8)>,
+    // The last HID++ battery event `(when, percent, charging)` a poll is
+    // reconciled with; `None` without one.
+    last_event: Option<(Instant, u8, bool)>,
 }
 
 /// Estimates the minutes left until the battery is empty (discharging) or
@@ -1566,6 +1616,7 @@ impl BridgeService {
             let (previous_dpi, previous_rate, previous_mode) = previous
                 .map(|entry| (entry.dpi, entry.polling_rate_hz, entry.switch_mode.clone()))
                 .unwrap_or((None, None, None));
+            let previous_event = previous.and_then(|entry| entry.last_event);
             if !state.battery.contains_key(&reading.device_id) {
                 while state.battery.len() >= MAX_BATTERY_ENTRIES {
                     let Some(oldest) = state
@@ -1595,6 +1646,13 @@ impl BridgeService {
                     switch_mode: reading.switch_mode.or(previous_mode),
                     updated_at: Instant::now(),
                     history,
+                    last_event: match reading.anchor {
+                        EventAnchor::Set => {
+                            Some((Instant::now(), reading.percent, reading.charging))
+                        }
+                        EventAnchor::Keep => previous_event,
+                        EventAnchor::Clear => None,
+                    },
                 },
             );
             let entry = &state.battery[&reading.device_id];
@@ -1660,6 +1718,12 @@ impl BridgeService {
     /// low-battery notification. Polling pauses while the control panel holds
     /// a HID session, so Bridge never talks to a mouse mid-session.
     pub fn start_battery_monitor(&self) {
+        let events = self.clone();
+        tokio::spawn(async move {
+            if events.inner.read().await.config.hidpp_battery_events {
+                events.start_battery_events();
+            }
+        });
         let service = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(BATTERY_POLL_INTERVAL);
@@ -1670,6 +1734,76 @@ impl BridgeService {
             }
         });
         self.start_device_scanner();
+    }
+
+    /// Keeps a Logitech receiver open and records its HID++ battery events as
+    /// they come (`hidppBatteryEvents`). The listener lets go of the receiver
+    /// while a control panel session is open; the timed poll keeps running.
+    fn start_battery_events(&self) {
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let spawned = crate::drivers::hidpp_battery::spawn(move |via, event| {
+            let _ = sender.send((via.to_owned(), event));
+        });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "Could not start the HID++ battery listener");
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut last_poll: Option<Instant> = None;
+            while let Some((via, event)) = events.recv().await {
+                if service.record_battery_event(&via, event).await {
+                    continue;
+                }
+                // No mouse read through this receiver yet: a poll names it.
+                if last_poll.is_none_or(|at| at.elapsed() >= ASLEEP_RECHECK) {
+                    last_poll = Some(Instant::now());
+                    tokio::spawn(poll_batteries(service.clone()));
+                }
+            }
+        });
+    }
+
+    /// Records a HID++ battery event that came through the bus device `via`
+    /// on the one mouse Bridge has read through it. Returns `false` when there
+    /// is no such mouse (none read yet, or several), and records nothing.
+    async fn record_battery_event(
+        &self,
+        via: &str,
+        event: crate::drivers::hidpp_battery::BatteryEvent,
+    ) -> bool {
+        let target = {
+            let state = self.inner.read().await;
+            let mut matches = state.known.devices().iter().filter(|device| {
+                device.native
+                    && (device.via.as_deref() == Some(via) || device.id == via)
+                    && state.battery.contains_key(&device.id)
+            });
+            match (matches.next(), matches.next()) {
+                (Some(device), None) => Some((
+                    device.id.clone(),
+                    state.battery[&device.id].device_name.clone(),
+                )),
+                _ => None,
+            }
+        };
+        let Some((device_id, device_name)) = target else {
+            return false;
+        };
+        let reading = BatteryReading {
+            device_id,
+            device_name,
+            percent: event.percent,
+            charging: event.charging,
+            via: Some(via.to_owned()),
+            native: true,
+            anchor: EventAnchor::Set,
+            ..BatteryReading::default()
+        };
+        if let Err(error) = self.record_battery(reading).await {
+            tracing::warn!(%error, "Could not record the battery event");
+        }
+        true
     }
 
     /// Lists the HID bus every few seconds to keep the connected state of the
@@ -2222,11 +2356,22 @@ async fn poll_batteries_once(service: BridgeService) {
                     }
                 }
                 let record_name = status.battery.reported_name.clone().unwrap_or(device_name);
+                let event = service
+                    .inner
+                    .read()
+                    .await
+                    .battery
+                    .get(&record_id)
+                    .and_then(|entry| entry.last_event)
+                    .map(|(at, percent, charging)| (at.elapsed(), percent, charging));
+                let (percent, charging, anchor) =
+                    reconcile_poll(status.battery.percent, status.battery.charging, event);
                 let reading = BatteryReading {
                     device_id: record_id,
                     device_name: record_name,
-                    percent: status.battery.percent,
-                    charging: status.battery.charging,
+                    percent,
+                    charging,
+                    anchor,
                     dpi: status.dpi,
                     polling_rate_hz: status.polling_rate_hz,
                     switch_mode: status.switch_mode,
@@ -3874,7 +4019,117 @@ mod tests {
             switch_mode: None,
             updated_at: Instant::now() - age,
             history: VecDeque::new(),
+            last_event: None,
         }
+    }
+
+    #[test]
+    fn a_recent_event_further_along_beats_a_lagging_poll() {
+        let minute = Duration::from_secs(60);
+        // mouse-protocol #170: polls kept saying 69% after the event said 68%.
+        assert_eq!(
+            reconcile_poll(69, false, Some((minute, 68, false))),
+            (68, false, EventAnchor::Keep)
+        );
+        assert_eq!(
+            reconcile_poll(70, true, Some((minute, 72, true))),
+            (72, true, EventAnchor::Keep),
+            "charging: higher is further"
+        );
+        // The poll moved past the event, or the state changed: the poll wins.
+        assert_eq!(
+            reconcile_poll(66, false, Some((minute, 68, false))),
+            (66, false, EventAnchor::Clear)
+        );
+        assert_eq!(
+            reconcile_poll(69, false, Some((minute, 69, false))),
+            (69, false, EventAnchor::Clear)
+        );
+        assert_eq!(
+            reconcile_poll(69, true, Some((minute, 60, false))),
+            (69, true, EventAnchor::Clear),
+            "plugged in since"
+        );
+        assert_eq!(
+            reconcile_poll(69, false, Some((BATTERY_EVENT_TRUST, 60, false))),
+            (69, false, EventAnchor::Clear),
+            "too old to trust"
+        );
+        assert_eq!(
+            reconcile_poll(69, false, None),
+            (69, false, EventAnchor::Clear)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_battery_event_updates_the_mouse_read_through_its_receiver() {
+        let bridge = service(BridgeConfig::default());
+        let event = crate::drivers::hidpp_battery::BatteryEvent {
+            percent: 70,
+            charging: false,
+        };
+        assert!(
+            !bridge
+                .record_battery_event("Logitech:046d:c54d", event)
+                .await,
+            "no mouse read through it yet: nothing recorded"
+        );
+        assert!(bridge.snapshot().await.batteries.is_empty());
+        bridge
+            .record_battery(BatteryReading {
+                via: Some("Logitech:046d:c54d".into()),
+                native: true,
+                ..reading("Logitech:PRO X2 SUPERSTRIKE", "PRO X2 SUPERSTRIKE", 69)
+            })
+            .await
+            .unwrap();
+        assert!(
+            bridge
+                .record_battery_event("Logitech:046d:c54d", event)
+                .await
+        );
+        let snapshot = bridge.snapshot().await;
+        assert_eq!(snapshot.batteries.len(), 1, "same row, no new one");
+        let battery = &snapshot.batteries[0];
+        assert_eq!(battery.device_id, "Logitech:PRO X2 SUPERSTRIKE");
+        assert_eq!(battery.percent, 70);
+        assert_eq!(battery.dpi, Some(1600), "the polled settings stay");
+        let state = bridge.inner.read().await;
+        let anchor = state.battery["Logitech:PRO X2 SUPERSTRIKE"].last_event;
+        assert_eq!(anchor.map(|(_, percent, _)| percent), Some(70));
+    }
+
+    #[tokio::test]
+    async fn a_panel_report_clears_the_event_anchor() {
+        let bridge = service(BridgeConfig::default());
+        bridge
+            .record_battery(BatteryReading {
+                anchor: EventAnchor::Set,
+                ..reading("Logitech:x", "X", 60)
+            })
+            .await
+            .unwrap();
+        bridge
+            .record_battery(BatteryReading {
+                anchor: EventAnchor::Keep,
+                ..reading("Logitech:x", "X", 61)
+            })
+            .await
+            .unwrap();
+        assert!(
+            bridge.inner.read().await.battery["Logitech:x"]
+                .last_event
+                .is_some()
+        );
+        bridge
+            .record_battery(reading("Logitech:x", "X", 59))
+            .await
+            .unwrap();
+        assert!(
+            bridge.inner.read().await.battery["Logitech:x"]
+                .last_event
+                .is_none()
+        );
     }
 
     fn history(minutes_ago_percent: &[(u64, u8)]) -> VecDeque<(Instant, u8)> {
