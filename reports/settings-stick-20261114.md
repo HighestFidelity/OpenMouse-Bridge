@@ -19,11 +19,11 @@ Motivation: openmouse #1473, where the MX Master 3S DPI resets to 1000 after sle
 - the_reapply_window_is_per_mouse_and_reopens_after_ten_seconds: per-mouse limit, reopens at 10 s, refuses a mouse of another brand.
 - a_connected_control_panel_suppresses_the_wake_reapply: an open HID session, Live mode and a fresh heartbeat each block it.
 - only_a_native_read_of_a_woken_mouse_owes_a_reapply: a panel-reported reading does not trigger it.
-- a_replugged_receiver_owes_a_reapply_on_the_next_native_read: receiver gone then back marks the mouse, and the next native read owes one reapply.
+- a_replugged_receiver_owes_a_reapply_on_the_next_native_read: receiver gone then back marks the mouse, and the next native read owes one reapply. It fills `replugged` by hand, so the scanner hook itself is checked only by reading the code.
 - The existing automation test a_requested_reapply_writes_the_same_profile_once_more proves the owed flag forces the second write.
 
 ## Not hardware-tested / limits
 - Not run on any real mouse. Whether the MX Master 3S actually keeps the rewritten DPI is unverified.
-- A wake is only seen if a poll caught the mouse asleep. Polls run every 5 min, and every 60 s once a mouse is marked asleep. A sleep/wake between polls is missed, and a detected wake reapplies up to about 60 s late. For #1473 that is the weak spot.
+- A wake is only seen if a poll caught the mouse asleep. Polls run every 5 min, and every 60 s once a mouse is marked asleep. A sleep/wake between polls is missed, and a detected wake reapplies up to about 60 s late. For #1473 that is the weak spot. PC suspend/resume is not detected as such and is untested: Bridge is frozen during it and may see neither an asleep read nor the mouse leaving the bus.
 - Race: if a panel session starts within the 3 s tick after admission, the owed write lands when the panel leaves, even with Hybrid off. The window is narrow.
 - Brand-level match: with two mice of the same brand, waking the one the profile is not for also rewrites the profile's mouse.
