@@ -6,6 +6,8 @@
 //! even though each is only used on one.
 #![allow(dead_code)]
 
+use super::MouseButton;
+
 /// Linux `KEY_A` to `KEY_Z`, in HID order (usage 0x04 is A).
 const LINUX_LETTERS: [u16; 26] = [
     30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45,
@@ -142,6 +144,28 @@ pub fn mac_modifier_keys(modifiers: u8) -> Vec<u16> {
     modifier_codes(modifiers, [59, 56, 58, 55])
 }
 
+/// The Linux `BTN_*` code of a mouse button.
+pub fn linux_mouse_button(button: MouseButton) -> u16 {
+    match button {
+        MouseButton::Left => 0x110,
+        MouseButton::Right => 0x111,
+        MouseButton::Middle => 0x112,
+        MouseButton::Back => 0x113,
+        MouseButton::Forward => 0x114,
+    }
+}
+
+/// The macOS button number of a mouse button (0 left, 1 right, 2 middle, 3 and 4 the sides).
+pub fn mac_mouse_button(button: MouseButton) -> u32 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Right => 1,
+        MouseButton::Middle => 2,
+        MouseButton::Back => 3,
+        MouseButton::Forward => 4,
+    }
+}
+
 fn modifier_codes(modifiers: u8, codes: [u16; 4]) -> Vec<u16> {
     codes
         .into_iter()
@@ -193,6 +217,16 @@ mod tests {
         assert_eq!(mac_key(0x52), Some(126), "Up");
         assert_eq!(mac_key(0x46), None, "Print Screen has no Mac key");
         assert_eq!(mac_modifier_keys(0b1001), [59, 55], "control and command");
+    }
+
+    #[test]
+    fn mouse_buttons_follow_each_systems_numbers() {
+        assert_eq!(linux_mouse_button(MouseButton::Left), 0x110, "BTN_LEFT");
+        assert_eq!(linux_mouse_button(MouseButton::Middle), 0x112, "BTN_MIDDLE");
+        assert_eq!(linux_mouse_button(MouseButton::Back), 0x113, "BTN_SIDE");
+        assert_eq!(linux_mouse_button(MouseButton::Forward), 0x114, "BTN_EXTRA");
+        assert_eq!(mac_mouse_button(MouseButton::Middle), 2);
+        assert_eq!(mac_mouse_button(MouseButton::Forward), 4);
         assert_eq!(mac_modifier_keys(0), Vec::<u16>::new());
     }
 

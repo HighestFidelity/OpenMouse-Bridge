@@ -61,6 +61,14 @@ pub struct BridgeConfig {
     pub profiles: Vec<ApplicationProfile>,
     #[serde(default)]
     pub default_profile: Option<ApplicationProfile>,
+    /// Bridge's own button assignments, which apply whichever game runs; a
+    /// game profile's `hostButtons` wins for the buttons it assigns. Empty
+    /// (the default) leaves the side buttons their normal clicks.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::buttons::remap::ButtonRemap::is_empty"
+    )]
+    pub button_remap: crate::buttons::remap::ButtonRemap,
     #[serde(default = "default_origins")]
     pub allowed_origins: Vec<String>,
     /// Whether Bridge has already turned launch-at-login on by default, so a
@@ -217,6 +225,7 @@ impl Default for BridgeConfig {
             local_applications: Vec::new(),
             profiles: Vec::new(),
             default_profile: None,
+            button_remap: Default::default(),
             allowed_origins: default_origins(),
             autostart_configured: false,
             tray_hint_shown: false,
@@ -846,6 +855,38 @@ mod tests {
     }
 
     #[test]
+    fn the_button_remap_round_trips_and_is_absent_until_set() {
+        use crate::buttons::{Action, BACK, FRONT, KeyAction, MouseButton};
+        let untouched = serde_json::to_value(BridgeConfig::default()).unwrap();
+        assert!(
+            untouched.get("buttonRemap").is_none(),
+            "a config nobody remapped is saved as before"
+        );
+        let mut config = BridgeConfig::default();
+        config
+            .button_remap
+            .set(
+                BACK,
+                Some(Action::Key(KeyAction {
+                    usage: 0x68,
+                    modifiers: 0x01,
+                })),
+            )
+            .unwrap();
+        config
+            .button_remap
+            .set(FRONT, Some(Action::Mouse(MouseButton::Middle)))
+            .unwrap();
+        let saved = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            saved["buttonRemap"],
+            serde_json::json!({"back": {"key": "F13", "modifiers": ["Ctrl"]}, "forward": {"mouse": "Middle"}})
+        );
+        let loaded: BridgeConfig = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.normalized().button_remap, config.button_remap);
+    }
+
+    #[test]
     fn normalization_clamps_threshold_and_cleans_executables() {
         let config = BridgeConfig {
             battery_threshold_percent: 140,
@@ -863,6 +904,7 @@ mod tests {
             hidpp_battery_events: false,
             profiles: Vec::new(),
             default_profile: None,
+            button_remap: Default::default(),
             allowed_origins: Vec::new(),
             local_applications: Vec::new(),
             autostart_configured: false,

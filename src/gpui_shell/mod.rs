@@ -483,6 +483,7 @@ pub(crate) fn test_snapshot() -> openmouse_bridge::service::BridgeSnapshot {
         battery_threshold_percent: 20,
         tray_battery_style: "glyph".to_owned(),
         hybrid_mode: true,
+        button_remap: Default::default(),
         device_mode: "onboard".to_owned(),
         autostart_enabled: false,
         automatic_updates: false,

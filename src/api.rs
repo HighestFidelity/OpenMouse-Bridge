@@ -729,4 +729,80 @@ mod tests {
         assert!(String::from_utf8_lossy(&message).contains("cannot be reached"));
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
+
+    fn profile_with(buttons: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "application": {"name": "Apex", "executable": "r5apex.exe", "path": ""},
+            "device": {"id": "Logitech:PRO X", "name": "PRO X"},
+            "settings": {"dpi": null, "pollingRateHz": null, "snapshot": {"hostButtons": buttons}},
+        })
+    }
+
+    /// Assignments from a web page become key presses. The panel sends every
+    /// profile at once and may record keys this OS cannot press, so a save
+    /// with entries off Bridge's allow-list still goes through (refusing it
+    /// would lose the whole save); `Assignments::from_profile` never presses
+    /// them.
+    #[tokio::test]
+    async fn profiles_with_assignments_off_the_allow_list_still_save() {
+        let (app, dir) = app();
+        for buttons in [
+            serde_json::json!({"8": {"key": 4, "keys": [5, 6, 7]}}),
+            serde_json::json!({"8": {"text": "hello"}}),
+            serde_json::json!({"16": {"key": 4, "repeat": 100}}),
+            serde_json::json!({"8": {"key": 255}}),
+            serde_json::json!({"8": {"consumer": 0x194}}),
+            serde_json::json!({"4": {"key": 4}}),
+        ] {
+            let (status, message, _) = call(
+                &app,
+                Method::PUT,
+                "/v1/profiles",
+                "application/json",
+                serde_json::to_vec(
+                    &serde_json::json!({"profiles": [profile_with(buttons.clone())]}),
+                )
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{buttons}: {}",
+                String::from_utf8_lossy(&message)
+            );
+            let (status, ..) = call(
+                &app,
+                Method::PUT,
+                "/v1/default-profile",
+                "application/json",
+                serde_json::to_vec(&profile_with(buttons.clone())).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{buttons}");
+        }
+
+        let good = profile_with(
+            serde_json::json!({"8": {"key": 0x68, "modifiers": 3}, "16": {"consumer": 233}}),
+        );
+        let (status, ..) = call(
+            &app,
+            Method::PUT,
+            "/v1/profiles",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({"profiles": [good.clone()]})).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, ..) = call(
+            &app,
+            Method::PUT,
+            "/v1/default-profile",
+            "application/json",
+            serde_json::to_vec(&good).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

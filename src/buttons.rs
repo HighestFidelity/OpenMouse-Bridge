@@ -13,6 +13,10 @@
 //! `{"8": {"key": 58, "modifiers": 0}, "16": {...}}`, keyed by the button's bit
 //! in the mouse's report (8 the back side button, 16 the front one), each a HID
 //! keyboard usage and a modifier mask (1 ctrl, 2 shift, 4 alt, 8 win).
+//!
+//! Bridge also keeps assignments of its own, `buttonRemap` in config.json, set
+//! in its panel, which apply whichever game runs (see `remap`). A game
+//! profile's assignment for a button wins over Bridge's own for that button.
 
 use std::{
     collections::BTreeMap,
@@ -27,6 +31,10 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::config::ApplicationProfile;
+
+pub mod remap;
+
+use remap::ButtonRemap;
 
 /// The back side button's bit in the mouse's button report.
 pub const BACK: u8 = 0x08;
@@ -50,11 +58,23 @@ pub struct KeyAction {
     pub modifiers: u8,
 }
 
+/// A mouse button Bridge can click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+    Back,
+    Forward,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Key(KeyAction),
     /// A media key, by its HID consumer usage (volume, play/pause, ...).
     Media(u16),
+    /// A click of another mouse button, held while the button is.
+    Mouse(MouseButton),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,20 +118,12 @@ impl Assignments {
         let mut actions = BTreeMap::new();
         for (bit, action) in buttons {
             let bit: u8 = bit.parse().ok().filter(|bit| SIDE_BUTTONS.contains(bit))?;
-            let action = if let Some(usage) = action.get("consumer") {
-                let usage = u16::try_from(usage.as_u64()?).ok()?;
-                media_virtual_key(usage)?;
-                Action::Media(usage)
-            } else {
-                let usage = u8::try_from(action.get("key")?.as_u64()?).ok()?;
-                // A key this system cannot press would also swallow the button's normal click.
-                can_press(usage).then_some(())?;
-                let modifiers =
-                    u8::try_from(action.get("modifiers").and_then(Value::as_u64).unwrap_or(0))
-                        .ok()
-                        .filter(|modifiers| *modifiers <= 0x0f)?;
-                Action::Key(KeyAction { usage, modifiers })
-            };
+            // The same allow-list the profile API checks, so the two cannot drift.
+            let action = remap::parse_host_action(action).ok()?;
+            // A key this system cannot press would also swallow the button's normal click.
+            if let Action::Key(key) = action {
+                can_press(key.usage).then_some(())?;
+            }
             actions.insert(bit, action);
         }
         (!actions.is_empty()).then(|| Self {
@@ -120,6 +132,43 @@ impl Assignments {
             actions,
             require_host: is_default,
         })
+    }
+}
+
+/// The assignments the helper should act on: Bridge's own, with the active
+/// profile's on top (a game's assignment for a button wins over Bridge's own
+/// for it). `None` when neither assigns anything.
+///
+/// Bridge's own assignments alone never switch a mouse to Host: they listen
+/// only to a Logitech mouse that already runs from software, whichever is
+/// connected. With a game's assignments the helper follows that profile.
+pub fn resolve(
+    profile: Option<(&ApplicationProfile, bool)>,
+    remap: &ButtonRemap,
+) -> Option<Assignments> {
+    let from_profile =
+        profile.and_then(|(profile, is_default)| Assignments::from_profile(profile, is_default));
+    let mut assignments = from_profile.unwrap_or_else(|| Assignments {
+        brand: "Logitech".into(),
+        device: String::new(),
+        actions: BTreeMap::new(),
+        require_host: true,
+    });
+    for (bit, action) in remap.actions() {
+        if pressable(*action) {
+            assignments.actions.entry(*bit).or_insert(*action);
+        }
+    }
+    (!assignments.actions.is_empty()).then_some(assignments)
+}
+
+/// Whether Bridge can carry out an action on this system: a Mac has no Print
+/// Screen key, and Bridge presses no media keys there yet.
+pub fn pressable(action: Action) -> bool {
+    match action {
+        Action::Key(key) => can_press(key.usage),
+        Action::Media(usage) => !cfg!(target_os = "macos") && media_virtual_key(usage).is_some(),
+        Action::Mouse(_) => true,
     }
 }
 
@@ -436,7 +485,8 @@ impl Drop for ButtonListener {
 
 enum Event {
     Buttons(u8),
-    Ready,
+    /// The button numbers the mouse said it reports.
+    Ready(Vec<u64>),
     Failed(String),
     Closed,
 }
@@ -511,7 +561,13 @@ fn run(
                     .and_then(Value::as_u64)
                     .and_then(|mask| u8::try_from(mask).ok())
                     .map(Event::Buttons),
-                Some("ready") => Some(Event::Ready),
+                Some("ready") => Some(Event::Ready(
+                    message
+                        .get("buttons")
+                        .and_then(Value::as_array)
+                        .map(|list| list.iter().filter_map(Value::as_u64).collect())
+                        .unwrap_or_default(),
+                )),
                 Some("error") => Some(Event::Failed(
                     message
                         .get("message")
@@ -546,8 +602,8 @@ fn run(
                 }
                 held = mask;
             }
-            Ok(Event::Ready) => {
-                tracing::info!("The mouse's buttons are being listened to");
+            Ok(Event::Ready(buttons)) => {
+                tracing::info!(?buttons, "The mouse's buttons are being listened to");
                 let _ = ready.send(());
             }
             Ok(Event::Failed(message)) => {
@@ -620,13 +676,16 @@ mod inject {
 
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_XDOWN,
-        MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput,
+        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
+        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW,
+        SendInput,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
     use super::{
-        Action, BACK, HeldKeys, KeyAction, Step, media_virtual_key, modifier_keys, virtual_key,
+        Action, BACK, HeldKeys, KeyAction, MouseButton, Step, media_virtual_key, modifier_keys,
+        virtual_key,
     };
 
     static HELD: Mutex<HeldKeys> = Mutex::new(HeldKeys::new());
@@ -640,8 +699,41 @@ mod inject {
             Step::Up(Action::Key(action)) => keys(action, false),
             Step::Down(Action::Media(usage)) => media(usage, true),
             Step::Up(Action::Media(usage)) => media(usage, false),
-            Step::SideDown(bit) => side(bit, true),
-            Step::SideUp(bit) => side(bit, false),
+            Step::Down(Action::Mouse(button)) => assigned_click(button, true),
+            Step::Up(Action::Mouse(button)) => assigned_click(button, false),
+            Step::SideDown(bit) => click(side(bit), true),
+            Step::SideUp(bit) => click(side(bit), false),
+        }
+    }
+
+    fn side(bit: u8) -> MouseButton {
+        if bit == BACK {
+            MouseButton::Back
+        } else {
+            MouseButton::Forward
+        }
+    }
+
+    /// A click two held buttons share goes down once and up with the last of
+    /// them. Counted by the mouse buttons' own virtual keys, which no key uses.
+    fn assigned_click(button: MouseButton, down: bool) {
+        let vk = match button {
+            MouseButton::Left => 0x01,
+            MouseButton::Right => 0x02,
+            MouseButton::Middle => 0x04,
+            MouseButton::Back => 0x05,
+            MouseButton::Forward => 0x06,
+        };
+        let changes = {
+            let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+            if down {
+                held.press(vk)
+            } else {
+                held.release(vk)
+            }
+        };
+        if changes {
+            click(button, down);
         }
     }
 
@@ -723,20 +815,22 @@ mod inject {
         }
     }
 
-    fn side(bit: u8, down: bool) {
-        let button = if bit == BACK { XBUTTON1 } else { XBUTTON2 };
+    fn click(button: MouseButton, down: bool) {
+        let (data, pressed, released) = match button {
+            MouseButton::Left => (0, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+            MouseButton::Right => (0, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+            MouseButton::Middle => (0, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+            MouseButton::Back => (u32::from(XBUTTON1), MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP),
+            MouseButton::Forward => (u32::from(XBUTTON2), MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP),
+        };
         send(&[INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
                 mi: MOUSEINPUT {
                     dx: 0,
                     dy: 0,
-                    mouseData: u32::from(button),
-                    dwFlags: if down {
-                        MOUSEEVENTF_XDOWN
-                    } else {
-                        MOUSEEVENTF_XUP
-                    },
+                    mouseData: data,
+                    dwFlags: if down { pressed } else { released },
                     time: 0,
                     dwExtraInfo: 0,
                 },
@@ -982,6 +1076,102 @@ mod tests {
                     modifiers: 0
                 }))
             ]
+        );
+    }
+
+    fn remap(config: Value) -> ButtonRemap {
+        serde_json::from_value::<crate::config::BridgeConfig>(json!({ "buttonRemap": config }))
+            .expect("config")
+            .button_remap
+    }
+
+    #[test]
+    fn bridges_own_assignments_apply_without_a_game_and_a_game_wins_per_button() {
+        let own = remap(json!({"back": {"key": "F13"}, "forward": {"media": "VolumeUp"}}));
+        let f13 = Action::Key(KeyAction {
+            usage: 0x68,
+            modifiers: 0,
+        });
+        let always = resolve(None, &own).expect("assignments without a game");
+        assert_eq!(always.actions[&BACK], f13);
+        assert_eq!(always.actions[&FRONT], Action::Media(0xe9));
+        assert!(
+            always.require_host && always.device.is_empty(),
+            "Bridge's own assignments never switch a mouse to Host"
+        );
+
+        let game = profile(
+            "Logitech:Mouse",
+            json!({"hostButtons": {"8": {"key": 4, "modifiers": 1}}}),
+        );
+        let merged = resolve(Some((&game, false)), &own).expect("assignments");
+        assert_eq!(
+            merged.actions[&BACK],
+            Action::Key(KeyAction {
+                usage: 4,
+                modifiers: 1
+            }),
+            "the game's assignment wins for its button"
+        );
+        assert_eq!(
+            merged.actions[&FRONT],
+            Action::Media(0xe9),
+            "the button the game leaves alone keeps Bridge's own"
+        );
+        assert_eq!(merged.device, "Mouse");
+        assert!(
+            !merged.require_host,
+            "the game's profile still decides the mode"
+        );
+
+        let other = profile("Razer:Viper", json!({"hostButtons": {"8": {"key": 4}}}));
+        assert_eq!(resolve(Some((&other, false)), &own), Some(always));
+        assert_eq!(
+            resolve(Some((&game, false)), &ButtonRemap::default()),
+            Assignments::from_profile(&game, false),
+            "no own assignments: exactly today's behaviour"
+        );
+        assert_eq!(resolve(None, &ButtonRemap::default()), None);
+    }
+
+    #[test]
+    fn a_press_becomes_the_assigned_key_media_key_or_click() {
+        let own = remap(json!({
+            "back": {"key": "F13", "modifiers": ["Ctrl", "Shift"]},
+            "forward": {"mouse": "Middle"},
+        }));
+        let assigned = resolve(None, &own).expect("assignments");
+        let mut held = HeldButtons::new();
+        let [Step::Down(Action::Key(key))] = transitions(&mut held, &assigned, 0, BACK)[..] else {
+            panic!("one key goes down");
+        };
+        assert_eq!(virtual_key(key.usage), Some(0x7c), "F13");
+        assert_eq!(modifier_keys(key.modifiers), [0x11, 0x10], "Ctrl, Shift");
+        assert_eq!(
+            transitions(&mut held, &assigned, BACK, BACK | FRONT),
+            [Step::Down(Action::Mouse(MouseButton::Middle))]
+        );
+        assert_eq!(
+            transitions(&mut held, &assigned, BACK | FRONT, 0),
+            [
+                Step::Up(Action::Key(key)),
+                Step::Up(Action::Mouse(MouseButton::Middle))
+            ]
+        );
+
+        let game = profile(
+            "Logitech:Mouse",
+            json!({"hostButtons": {"16": {"consumer": 233}}}),
+        );
+        let merged = resolve(Some((&game, false)), &own).expect("assignments");
+        let [Step::Down(Action::Media(usage))] = steps(&merged, 0, FRONT)[..] else {
+            panic!("the game's media key goes down");
+        };
+        assert_eq!(media_virtual_key(usage), Some(0xaf), "volume up");
+        assert_eq!(
+            steps(&merged, 0, 0x01 | 0x02 | 0x04),
+            [],
+            "left, right and middle are never acted on"
         );
     }
 
