@@ -68,3 +68,7 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   ubuntu-latest on every push since 11-13. [Inference] a full VM lists kernel threads (thread_kind Some(Kernel)); the box
   container hides them (0 there). Test now rejects only userland threads. Box: test ok, clippy clean. Not run on a VM.
 - Bridge CI workflow (414290262) disabled on the fork 11-14 (Victor got run-failed mails). Re-enable only on his yes.
+- t3/settings-stick (F1, P9-OMB22, refs openmouse #1473): a Bridge-taken reading right after a mouse wakes or its
+  device/receiver returns to the bus triggers one forced reapply of the profile in force (onboard mode, no panel
+  connected, profile of that brand with DPI or polling, max once per mouse per 10 s). Wake is only seen when a poll
+  caught the mouse asleep (5 min / 60 s polls); OS suspend/resume not hooked. Windows tests 292+39+11. No hardware test.
