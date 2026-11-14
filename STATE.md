@@ -205,3 +205,8 @@ At the very end: Victor approves every upstream PR before it is opened; Windows 
 
 NEXT: merge F4.1 after review, build4 exe, Victor tests on G305 (hidppBatteryEvents on, remap, settings stick). Then
 prepare (not open) PR branches: batch B CI (7-9), simplify S-items, F1/F2/F3 upstream versions. Web app fork work (#74).
+- 068c792: F4.1 remap merged (coordinator made off-list hostButtons a warning, not a 400). Box 340+53+11 green.
+  build4 = Desktop\openmouse-bridge-build4.exe sha256 478f29bf...4f732 (main 068c792); test steps sent to Victor (G305).
+- PR prep child (batch B 7-9 + simplify 1-6) died on the account 429 (reset ~3h after 11-14 midday PT); its omb-pr-*
+  worktrees under C:\Users\Victo may hold partial work: resume, don't restart. pr/tray-reentrancy is ready.
+- Deleted (beyond the 5 named in Victor's yes, same class): merged t3/battery-voltage worktree + cache. Kept: remap worktree.
