@@ -88,3 +88,7 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   off) listener for unsolicited HID++ 0x1004/0x1000 battery events on one Logitech receiver with one battery mouse;
   closes within ~250 ms when a panel session starts; 5 min poll stays as fallback. Layouts from mouse-protocol v0.59.0
   and Linux hid-logitech-hidpp.c, no captures. Two Logitech devices: events dropped, poll only. Hardware-untested.
+- t3/settings-stick-panel (coordinator review of F1/F2): a wake/replug write is dropped, not deferred, when a panel holds
+  the mouse at the next pass (was: fired when the panel left, over the panel's changes); feature-report siblings are
+  vendor-page interfaces only (N5). Note: hid::tests::concurrent_enumeration_does_not_crash (upstream 404847f) takes
+  ~24 s on E-Daddy (72 serial real enumerations), machine-dependent, not a timeout.
