@@ -72,3 +72,8 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   device/receiver returns to the bus triggers one forced reapply of the profile in force (onboard mode, no panel
   connected, profile of that brand with DPI or polling, max once per mouse per 10 s). Wake is only seen when a poll
   caught the mouse asleep (5 min / 60 s polls); OS suspend/resume not hooked. Windows tests 292+39+11. No hardware test.
+- t3/tray-reentrancy (P9-OMB27, upstream issue #120): root cause confirmed in gpui source: moving the panel onto another
+  monitor runs GPUI's display-changed callback (window.rs:1971), which borrows the App that update_window already holds
+  (async_context.rs:178 panic). Windows now plans the placement inside update_window and calls SetWindowPos/ShowWindow/
+  SetForegroundWindow after it returns. 4 placement tests (negative-x monitor). Test exe Desktop\openmouse-bridge-tray-fix.exe
+  sha256 4a3897d6...00925 (built on the branch). Not run yet: needs Victor's 2-monitor test.
