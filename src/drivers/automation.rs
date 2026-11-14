@@ -115,6 +115,12 @@ impl NativeAutomation {
         self.apply_deferred = true;
     }
 
+    /// Whether a forced write is still owed, clearing it (tests only).
+    #[cfg(test)]
+    pub fn take_reapply_owed(&mut self) -> bool {
+        std::mem::take(&mut self.apply_deferred)
+    }
+
     pub fn pending_restores_for(&self, desired: Option<&ApplicationProfile>) -> usize {
         self.entries
             .iter()
