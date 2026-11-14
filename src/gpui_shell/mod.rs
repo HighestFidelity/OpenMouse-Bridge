@@ -312,6 +312,11 @@ pub fn run() -> Result<()> {
                                 cx.background_executor().timer(LAYER_MAP_DELAY).await;
                             }
                         }
+                        // Windows moves and raises the panel outside the App
+                        // borrow (issue #120, see `tray::show_from_loop`).
+                        #[cfg(windows)]
+                        tray::show_from_loop(cx, handle, anchor);
+                        #[cfg(not(windows))]
                         let _ = cx.update_window(handle, |_, window, _| tray::show(window, anchor));
                     }
                     for command in tray_requests {

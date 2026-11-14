@@ -252,8 +252,7 @@ mod platform {
         }
     }
 
-    /// Distance kept from the work area's edges and from the icon, in pixels.
-    const MARGIN: f64 = 8.0;
+    use super::MARGIN;
 
     fn hwnd_of(window: &Window) -> Option<windows_sys::Win32::Foundation::HWND> {
         match HasWindowHandle::window_handle(window).map(|handle| handle.as_raw()) {
@@ -271,14 +270,39 @@ mod platform {
         }
     }
 
-    pub fn show_window(window: &mut Window) -> bool {
-        if let Some(hwnd) = hwnd_of(window) {
-            unsafe {
-                ShowWindow(hwnd, SW_RESTORE);
-                SetForegroundWindow(hwnd);
-            }
+    /// Where [`place_and_raise`] moves the panel, worked out while GPUI has the
+    /// window borrowed so the Win32 calls can run after it lets go.
+    pub struct Placement {
+        hwnd: windows_sys::Win32::Foundation::HWND,
+        origin: Option<(i32, i32)>,
+    }
+
+    fn move_to(hwnd: windows_sys::Win32::Foundation::HWND, (x, y): (i32, i32)) {
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
-        false
+    }
+
+    /// Moves the panel to `placement` and brings it to the front. These calls
+    /// send messages straight to GPUI's window procedure, and a move onto
+    /// another monitor runs GPUI's display-changed callback, which borrows the
+    /// App: so this must run outside `update_window` (issue #120).
+    pub fn place_and_raise(placement: &Placement) {
+        if let Some(origin) = placement.origin {
+            move_to(placement.hwnd, origin);
+        }
+        unsafe {
+            ShowWindow(placement.hwnd, SW_RESTORE);
+            SetForegroundWindow(placement.hwnd);
+        }
     }
 
     pub fn anchor_of_icon(rect: &tray_icon::Rect) -> Anchor {
@@ -290,14 +314,26 @@ mod platform {
         }
     }
 
-    /// Puts the panel's right edge on the icon's, above it when the icon is in
-    /// the lower half of its screen (a bottom taskbar) and below it otherwise,
-    /// kept inside the work area. With no click to go by it goes to the primary
-    /// screen's bottom-right corner.
+    /// Moves the panel beside the tray icon (see [`super::origin_near_tray`]).
+    /// Only for the launch-time placement, which stays on the primary monitor
+    /// the panel opened on: a move that may cross monitors goes through
+    /// [`plan_near_tray`] and [`place_and_raise`] instead.
     pub fn place_near_tray(window: &Window, anchor: Option<Anchor>) {
-        let Some(hwnd) = hwnd_of(window) else {
-            return;
-        };
+        if let Some(Placement {
+            hwnd,
+            origin: Some(origin),
+        }) = plan_near_tray(window, anchor)
+        {
+            move_to(hwnd, origin);
+        }
+    }
+
+    /// Works out where the panel goes beside the tray icon: on the icon's
+    /// monitor, or the primary one with no click to go by. Sends the window no
+    /// message. `None` when the window has no HWND; no origin when the
+    /// monitor cannot be read.
+    pub fn plan_near_tray(window: &Window, anchor: Option<Anchor>) -> Option<Placement> {
+        let hwnd = hwnd_of(window)?;
         let scale = f64::from(window.scale_factor());
         let size = window.bounds().size;
         let (width, height) = (
@@ -322,39 +358,48 @@ mod platform {
                 None => MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY),
             }
         };
-        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
-            return;
-        }
-        let work = info.rcWork;
-        let (work_left, work_top) = (f64::from(work.left), f64::from(work.top));
-        let (work_right, work_bottom) = (f64::from(work.right), f64::from(work.bottom));
-        let icon = anchor.unwrap_or(Anchor {
-            left: work_right,
-            top: work_bottom,
-            right: work_right,
-            bottom: work_bottom,
+        let origin = (unsafe { GetMonitorInfoW(monitor, &mut info) } != 0).then(|| {
+            let work = Anchor {
+                left: f64::from(info.rcWork.left),
+                top: f64::from(info.rcWork.top),
+                right: f64::from(info.rcWork.right),
+                bottom: f64::from(info.rcWork.bottom),
+            };
+            let (x, y) = super::origin_near_tray(work, anchor, width, height);
+            (x as i32, y as i32)
         });
-        let x = icon.right - width;
-        let y = if (icon.top + icon.bottom) / 2.0 > (work_top + work_bottom) / 2.0 {
-            icon.top - height - MARGIN
-        } else {
-            icon.bottom + MARGIN
-        };
-        let clamp = |value: f64, low: f64, high: f64| value.clamp(low, high.max(low));
-        let x = clamp(x, work_left + MARGIN, work_right - width - MARGIN);
-        let y = clamp(y, work_top + MARGIN, work_bottom - height - MARGIN);
-        unsafe {
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                x as i32,
-                y as i32,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
+        Some(Placement { hwnd, origin })
     }
+}
+
+/// Distance kept from the work area's edges and from the icon, in pixels.
+#[cfg(any(windows, test))]
+const MARGIN: f64 = 8.0;
+
+/// Where the panel's top-left corner goes on Windows, in physical pixels: its
+/// right edge on the icon's, above the icon when that is in the lower half of
+/// the monitor's work area `work` (a bottom taskbar) and below it otherwise,
+/// kept inside `work`. With no icon, the work area's bottom-right corner. A
+/// monitor left of or above the primary one has negative coordinates.
+#[cfg(any(windows, test))]
+fn origin_near_tray(work: Anchor, icon: Option<Anchor>, width: f64, height: f64) -> (f64, f64) {
+    let icon = icon.unwrap_or(Anchor {
+        left: work.right,
+        top: work.bottom,
+        right: work.right,
+        bottom: work.bottom,
+    });
+    let x = icon.right - width;
+    let y = if (icon.top + icon.bottom) / 2.0 > (work.top + work.bottom) / 2.0 {
+        icon.top - height - MARGIN
+    } else {
+        icon.bottom + MARGIN
+    };
+    let clamp = |value: f64, low: f64, high: f64| value.clamp(low, high.max(low));
+    (
+        clamp(x, work.left + MARGIN, work.right - width - MARGIN),
+        clamp(y, work.top + MARGIN, work.bottom - height - MARGIN),
+    )
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -594,11 +639,37 @@ pub fn keep_on_screen(window: &Window, height: f32) {
     let _ = (window, height);
 }
 
+#[cfg(not(windows))]
 pub fn show(window: &mut Window, anchor: Option<Anchor>) {
     platform::place_near_tray(window, anchor);
     if !platform::show_window(window) {
         window.activate_window();
     }
+    VISIBLE.store(true, Ordering::Relaxed);
+}
+
+/// Shows the panel beside the tray icon from the poll loop. The placement is
+/// worked out inside `update_window`, but `SetWindowPos`, `ShowWindow` and
+/// `SetForegroundWindow` run after it returns: they call GPUI's window
+/// procedure synchronously, and moving the panel onto another monitor (a tray
+/// left of the primary one, issue #120) runs GPUI's display-changed callback,
+/// whose `AsyncApp::update` panicked with "RefCell already borrowed" while
+/// `update_window` held the App.
+#[cfg(windows)]
+pub fn show_from_loop(
+    cx: &mut gpui_kit::AsyncApp,
+    handle: AnyWindowHandle,
+    anchor: Option<Anchor>,
+) {
+    let Ok(placement) = cx.update_window(handle, |_, window, _| {
+        platform::plan_near_tray(window, anchor)
+    }) else {
+        return;
+    };
+    if let Some(placement) = &placement {
+        platform::place_and_raise(placement);
+    }
+    let _ = cx.update_window(handle, |_, window, _| window.activate_window());
     VISIBLE.store(true, Ordering::Relaxed);
 }
 
@@ -819,5 +890,60 @@ mod tests {
             layer_margins(Some(screen()), None),
             (px(8.), px(8.), px(8.), px(8.))
         );
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::{Anchor, origin_near_tray};
+
+    fn rect(left: f64, top: f64, right: f64, bottom: f64) -> Anchor {
+        Anchor {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    const PANEL: (f64, f64) = (400.0, 600.0);
+
+    #[test]
+    fn a_tray_on_a_monitor_left_of_the_primary_keeps_the_panel_on_that_monitor() {
+        // Issue #120: a 1280x1024 monitor left of the primary one, its
+        // taskbar 48 px tall along the bottom, the icon near x = -715.
+        let work = rect(-1280.0, 0.0, 0.0, 976.0);
+        let icon = rect(-730.0, 984.0, -700.0, 1016.0);
+        let (x, y) = origin_near_tray(work, Some(icon), PANEL.0, PANEL.1);
+        assert_eq!(x, -1100.0, "right edge on the icon's");
+        assert_eq!(
+            y,
+            976.0 - 600.0 - 8.0,
+            "above the taskbar, in the work area"
+        );
+        assert!(x >= work.left && x + PANEL.0 <= work.right);
+    }
+
+    #[test]
+    fn the_panel_is_clamped_to_the_left_edge_of_a_negative_monitor() {
+        let work = rect(-1280.0, 0.0, 0.0, 976.0);
+        let icon = rect(-1270.0, 984.0, -1250.0, 1016.0);
+        let (x, _) = origin_near_tray(work, Some(icon), PANEL.0, PANEL.1);
+        assert_eq!(x, -1280.0 + 8.0);
+    }
+
+    #[test]
+    fn with_no_click_the_panel_goes_to_the_bottom_right_corner() {
+        let work = rect(0.0, 0.0, 1920.0, 1040.0);
+        let (x, y) = origin_near_tray(work, None, PANEL.0, PANEL.1);
+        assert_eq!((x, y), (1920.0 - 400.0 - 8.0, 1040.0 - 600.0 - 8.0));
+    }
+
+    #[test]
+    fn a_top_taskbar_puts_the_panel_below_the_icon() {
+        let work = rect(0.0, 48.0, 1920.0, 1080.0);
+        let icon = rect(1700.0, 8.0, 1730.0, 40.0);
+        let (x, y) = origin_near_tray(work, Some(icon), PANEL.0, PANEL.1);
+        assert_eq!((x, y), (1330.0, 56.0));
     }
 }
