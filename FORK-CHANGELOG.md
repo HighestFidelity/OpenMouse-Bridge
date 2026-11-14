@@ -57,3 +57,10 @@ Upstream's CHANGELOG.md is release notes; fork-only work is logged here.
   - Checks on main: fmt ok, cargo test 299+43+11, clippy clean linux + windows-gnu, scripts 16/16, native-hid 32 pass
     (2 baseline fails need node-hid).
 - Upstream triage and PR plan: reports/upstream-triage.md, reports/upstream-pr-plan.md (Opus; Fable 5.2 review later).
+
+## 2026-11-14
+- t3/sync-upstream (P9-OMB26): real merge of upstream/main 66ba469 (v1.0.1, our #106-#109 #116-#119 back as squashes).
+  Took upstream's Iris (#60), kept our Scyrox port (loads without the protocol package), bridge-server.mjs stays deleted
+  (nothing loads it). Fork hardening kept; upstream's update-keyboard-protocol.yml and weekly-release.yml SHA-pinned.
+  Checks: Linux fmt ok, cargo test 298+46+11, clippy clean linux + windows-gnu, scripts 20/20; Windows tests 287+39+11.
+  Report: reports/sync-upstream-20261114.md.
