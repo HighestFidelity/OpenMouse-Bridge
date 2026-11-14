@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    ffi::{CStr, CString},
+    ffi::CString,
     ops::ControlFlow,
     sync::{
         Arc, Mutex, Once, OnceLock, PoisonError,
@@ -1713,13 +1713,13 @@ fn usable_container_id(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> Op
 }
 
 #[cfg(target_os = "windows")]
-fn physical_device_key(device: &HidDevice, _path: &CStr) -> Option<Vec<u8>> {
+fn physical_device_key(device: &HidDevice, _path: &std::ffi::CStr) -> Option<Vec<u8>> {
     let id = device.get_container_id().ok()?;
     usable_container_id(id.data1, id.data2, id.data3, id.data4)
 }
 
 #[cfg(target_os = "linux")]
-fn physical_device_key(_device: &HidDevice, path: &CStr) -> Option<Vec<u8>> {
+fn physical_device_key(_device: &HidDevice, path: &std::ffi::CStr) -> Option<Vec<u8>> {
     let node = path.to_str().ok()?.strip_prefix("/dev/")?;
     let uevent = std::fs::read_to_string(format!("/sys/class/hidraw/{node}/device/uevent")).ok()?;
     usb_port_from_uevent(&uevent).map(String::into_bytes)
@@ -1728,7 +1728,7 @@ fn physical_device_key(_device: &HidDevice, path: &CStr) -> Option<Vec<u8>> {
 /// The identity of an open handle: vendor, product and serial from the handle
 /// itself, the physical key from the handle (Windows) or its node (Linux).
 #[cfg(any(target_os = "windows", target_os = "linux"))]
-fn physical_identity(device: &HidDevice, path: &CStr) -> Option<PhysicalIdentity> {
+fn physical_identity(device: &HidDevice, path: &std::ffi::CStr) -> Option<PhysicalIdentity> {
     let info = device.get_device_info().ok()?;
     Some(PhysicalIdentity::new(
         info.vendor_id(),
@@ -1768,7 +1768,8 @@ fn scan_feature_siblings(api: &HidApi, open: &OpenDevice) -> Vec<SiblingPath> {
     }) else {
         return Vec::new();
     };
-    let opened: HashSet<&CStr> = open.paths.iter().map(|path| path.path.as_c_str()).collect();
+    let opened: HashSet<&std::ffi::CStr> =
+        open.paths.iter().map(|path| path.path.as_c_str()).collect();
     let blocked = security_key_paths(api);
     let mut seen = HashSet::new();
     let mut siblings = Vec::new();
